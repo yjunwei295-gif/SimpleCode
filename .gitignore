@@ -1,0 +1,26 @@
+node_modules/
+dist/
+out/
+*.log
+.DS_Store
+Thumbs.db
+
+# 个人 IDE / Claude 本地设置
+.claude/
+.idea/
+.vscode/
+
+# 密钥与本机运行数据（在 %APPDATA%\SimpleCode，勿提交）
+.env
+.env.*
+settings.json
+sessions/
+userData/
+
+# 本地下载的模型与测试包
+*.gguf
+*.GGUF
+models/*.gguf
+models/*.GGUF
+Test.zip
+*.zip

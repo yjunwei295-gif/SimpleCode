@@ -1,0 +1,21 @@
+{
+  "name": "simplecode",
+  "productName": "SimpleCode",
+  "version": "0.1.0",
+  "description": "桌面 AI 编程助手",
+  "main": "electron/main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "devDependencies": {
+    "electron": "^37.2.4"
+  },
+  "dependencies": {
+    "jszip": "^3.10.1",
+    "mammoth": "^1.9.1",
+    "node-llama-cpp": "^3.20.0",
+    "pdf-parse": "^1.1.1",
+    "word-extractor": "^1.0.4",
+    "xlsx": "^0.18.5"
+  }
+}
