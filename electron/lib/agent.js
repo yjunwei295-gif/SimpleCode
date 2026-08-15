@@ -12,6 +12,7 @@ const mmproj = require('./mmproj');
 const visionEngine = require('./vision-engine');
 const replyLang = require('./reply-lang');
 const webSearch = require('./web-search');
+const generate = require('./generate');
 
 const MAX_ROUNDS = 32;
 
@@ -217,6 +218,93 @@ async function execTool(workspace, snap, name, args, onEvent, extra, signal, lan
     return searchText(workspace, args.query || '', args.glob || '');
   }
   return `未知工具：${name}`;
+}
+
+function fileStamp() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+}
+
+function writeGeneratedFile(workspace, extra, snap, rel, data, encoding) {
+  if (!workspace) throw new Error('请先打开项目，生成的文件才能保存到工作目录。');
+  const abs = resolveAllowed(workspace, extra, rel);
+  const inWs = isInside(workspace, abs);
+  if (inWs) {
+    const wsRel = path.relative(workspace, abs).replace(/\\/g, '/');
+    if (!snap.current) snap.current = snapshot.create(workspace, '自动更改快照');
+    snapshot.recordChange(workspace, snap.current, wsRel, 'write');
+  }
+  fs.mkdirSync(path.dirname(abs), { recursive: true });
+  if (encoding === 'utf8') fs.writeFileSync(abs, data, 'utf8');
+  else fs.writeFileSync(abs, data);
+  return path.relative(workspace, abs).replace(/\\/g, '/');
+}
+
+/**
+ * 生图/生视频/生3D/生文档：按组合槽位出文件，再把路径注入主模型
+ */
+async function runGenerateSlots({ vs, userText, workspace, extra, extraTexts, onEvent, signal, snap, lang }) {
+  const wanted = assembly.detectRoles(userText, { hasImages: false, contextChars: 0 })
+    .filter((r) => assembly.GEN_ROLE_IDS.includes(r));
+  for (const role of wanted) {
+    const roleName = (assembly.ROLES.find((x) => x.id === role) || {}).name || role;
+    const slot = assembly.slotByRole(vs, role);
+    if (!slot) {
+      onEvent({ type: 'think', text: `检测到${roleName}需求，但当前组合未挂${roleName}模型。` });
+      continue;
+    }
+    const helperCfg = assembly.slotToModelCfg(slot, vs);
+    if (!helperCfg) {
+      onEvent({ type: 'think', text: `${roleName}槽位还没有选模型。` });
+      continue;
+    }
+    const helperLabel = helperCfg.model || helperCfg.name || roleName;
+    onEvent({ type: 'status', text: `正在用${roleName}模型 ${helperLabel} 生成…` });
+    diag.log('agent', '路由到生成槽位', { role, model: helperLabel });
+    try {
+      if (role === 'docGen') {
+        const msg = await completeWithFallback({
+          modelCfg: helperCfg,
+          messages: [
+            { role: 'system', content: assembly.helperPrompt(role, lang) },
+            { role: 'user', content: String(userText || '').slice(0, 24000) || '请写一份文档' }
+          ],
+          noTools: true,
+          signal,
+          onDelta: () => {},
+          onWait: (sec) => onEvent({ type: 'status', text: `${roleName}模型处理中 · ${sec}` })
+        });
+        const out = String(msg?.content || '').trim();
+        if (!out) throw new Error('文档模型没有返回内容');
+        const rel = writeGeneratedFile(workspace, extra, snap, `generated/doc-${fileStamp()}.md`, out, 'utf8');
+        extraTexts.push(`—— 以下是${roleName}模型「${helperLabel}」已写入的文档 ——`);
+        extraTexts.push(`文件：${rel}\n\n${out.slice(0, 8000)}`);
+        onEvent({ type: 'think', text: `已生成文档 ${rel}` });
+        continue;
+      }
+      const asset = await generate.generateMedia({
+        role,
+        modelCfg: helperCfg,
+        prompt: userText,
+        signal
+      });
+      const rel = writeGeneratedFile(
+        workspace,
+        extra,
+        snap,
+        `generated/${role}-${fileStamp()}${asset.ext || '.bin'}`,
+        asset.buf
+      );
+      extraTexts.push(`—— ${roleName}已完成，文件在工作目录：${rel}。请据此继续回答用户，不要说还没生成。 ——`);
+      onEvent({ type: 'think', text: `已生成文件 ${rel}` });
+    } catch (e) {
+      if (e.name === 'AbortError') throw e;
+      extraTexts.push(`【${roleName}失败】${e.message}`);
+      onEvent({ type: 'think', text: `${roleName}失败：${e.message}` });
+      diag.log('agent', '生成槽位失败', { role, message: e && e.message });
+    }
+  }
 }
 
 function buildSystemPrompt({ workspace, rules, skill, extra, allSkills, persona, visionMode, visionBridge, lang }) {
@@ -921,6 +1009,7 @@ async function runTurn({
 
   const extra = extraRoots(appRoot, workspace);
   const persona = skillsLib.loadPersona(appRoot).body || '';
+  const snap = { current: null };
   const vs = store.load();
   const vis = assembly.visionFrom(vs);
   const lang = replyLang.resolve({ locale: vs.locale, userText, history });
@@ -1008,10 +1097,12 @@ async function runTurn({
     }
   }
 
+  await runGenerateSlots({ vs, userText, workspace, extra, extraTexts, onEvent, signal, snap, lang });
+
   const helperRoles = assembly.detectRoles(userText, {
     hasImages: skippedImages.length > 0,
     contextChars: ctxChunks.join('\n').length + extraTexts.join('\n').length
-  }).filter((r) => r !== 'vision');
+  }).filter((r) => assembly.TEXT_HELPER_IDS.includes(r));
   for (const role of helperRoles) {
     const slot = assembly.slotByRole(vs, role);
     if (!slot) continue;
@@ -1097,7 +1188,6 @@ async function runTurn({
     { role: 'user', content: parts.length ? userContent : textBlock }
   ];
 
-  const snap = { current: null };
   onEvent({ type: 'think', text: `正在调用 ${modelCfg.model}...` });
   const finalText = await agentLoop({ modelCfg, messages, workspace, extra, snap, onEvent, signal, lang });
 

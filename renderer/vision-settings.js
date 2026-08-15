@@ -170,7 +170,11 @@ const ROLES = [
   { id: 'vision', key: 'roleVision' },
   { id: 'summary', key: 'roleSummary' },
   { id: 'code', key: 'roleCode' },
-  { id: 'planning', key: 'rolePlanning' }
+  { id: 'planning', key: 'rolePlanning' },
+  { id: 'imageGen', key: 'roleImageGen' },
+  { id: 'videoGen', key: 'roleVideoGen' },
+  { id: 'model3d', key: 'roleModel3d' },
+  { id: 'docGen', key: 'roleDocGen' }
 ];
 
 let visionState = {

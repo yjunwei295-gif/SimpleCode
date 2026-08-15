@@ -4,8 +4,15 @@ const ROLES = [
   { id: 'vision', name: '看图', hint: '主模型看不到图时，先用这个模型识别画面' },
   { id: 'summary', name: '总结', hint: '长文、摘要、概括时先压缩再交给主模型' },
   { id: 'code', name: '代码', hint: '写代码、改 bug 时先出一版草案再交给主模型' },
-  { id: 'planning', name: '规划', hint: '复杂任务先拆步骤再交给主模型执行' }
+  { id: 'planning', name: '规划', hint: '复杂任务先拆步骤再交给主模型执行' },
+  { id: 'imageGen', name: '生图', hint: '画图、出插画时用挂上的接口直接出图' },
+  { id: 'videoGen', name: '生视频', hint: '做短片时用挂上的接口直接出视频' },
+  { id: 'model3d', name: '生3D', hint: '做三维模型时用挂上的接口直接出 3D 文件' },
+  { id: 'docGen', name: '生文档', hint: '写说明、手册时先成文再保存到工作目录' }
 ];
+
+const GEN_ROLE_IDS = ['imageGen', 'videoGen', 'model3d', 'docGen'];
+const TEXT_HELPER_IDS = ['summary', 'code', 'planning'];
 
 function assemblyKey(s) {
   const m = (s.models || []).find((x) => x.id === s.currentModelId);
@@ -117,6 +124,22 @@ function detectRoles(userText, { hasImages, contextChars }) {
   const t = String(userText || '');
   const roles = [];
   if (hasImages) roles.push('vision');
+  if (/生成视频|生视频|做个视频|做一段视频|text to video|generate (a |an )?video|视频生成/i.test(t)) {
+    roles.push('videoGen');
+  }
+  if (/生成\s*3D|3D\s*模型|三维模型|生3D|generate (a |an )?3d|text to 3d/i.test(t)) {
+    roles.push('model3d');
+  }
+  if (/生成文档|写一份文档|写文档|生文档|生成一份(说明|文档|手册)|write (a |an )?document/i.test(t)) {
+    roles.push('docGen');
+  }
+  if (
+    /生图|画一张|画个|帮我画|生成(一张|几张)?(图片|插画|海报)|text to image|generate (an |a )?image/i.test(t)
+    && !roles.includes('videoGen')
+    && !roles.includes('model3d')
+  ) {
+    roles.push('imageGen');
+  }
   if (/总结|摘要|概括|精简|summar/i.test(t) || (contextChars || 0) > 8000) roles.push('summary');
   if (/写代码|改代码|重构|实现|修 bug|修bug|函数|组件|补全/i.test(t)) roles.push('code');
   if (/规划|计划|拆解|分步|方案|怎么做/i.test(t)) roles.push('planning');
@@ -135,10 +158,13 @@ function helperPrompt(role, lang) {
   if (role === 'planning') {
     return `You are a planning helper. Split the task into steps with order and risks. Do not call tools. ${langLine}`;
   }
+  if (role === 'docGen') {
+    return `You write a complete markdown document from the user's request. Output markdown only, no chatter. Start with a title. Do not call tools. ${langLine}`;
+  }
   return `Answer briefly. Do not call tools. ${langLine}`;
 }
 
 module.exports = {
-  ROLES, assemblyKey, slotsOf, slotByRole, migrateAssemblies,
+  ROLES, GEN_ROLE_IDS, TEXT_HELPER_IDS, assemblyKey, slotsOf, slotByRole, migrateAssemblies,
   visionFrom, syncVisionFields, slotToModelCfg, detectRoles, helperPrompt
 };
