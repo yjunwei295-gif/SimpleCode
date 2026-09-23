@@ -15,6 +15,50 @@ function vectorsPath() {
   return path.join(globalDir(), 'vectors.json');
 }
 
+function blocklistPath() {
+  return path.join(globalDir(), 'deleted-blocklist.json');
+}
+
+const BLOCKLIST_MAX = 200;
+
+function loadBlocklist() {
+  const p = blocklistPath();
+  if (!fs.existsSync(p)) return [];
+  try {
+    const data = JSON.parse(fs.readFileSync(p, 'utf8'));
+    return Array.isArray(data?.items) ? data.items : [];
+  } catch {
+    return [];
+  }
+}
+
+function similarSummary(a, b) {
+  const x = String(a || '').replace(/\s+/g, '').toLowerCase();
+  const y = String(b || '').replace(/\s+/g, '').toLowerCase();
+  if (!x || !y) return false;
+  if (x === y) return true;
+  if (x.includes(y) || y.includes(x)) return true;
+  return false;
+}
+
+function pushBlocklist(entry) {
+  if (!entry) return;
+  const items = loadBlocklist();
+  items.push({
+    summary: String(entry.summary || '').slice(0, 400),
+    deletedAt: nowIso(),
+    id: String(entry.id || '')
+  });
+  fs.mkdirSync(globalDir(), { recursive: true });
+  fs.writeFileSync(blocklistPath(), JSON.stringify({ version: 1, items: items.slice(-BLOCKLIST_MAX) }, null, 2), 'utf8');
+}
+
+function isPrefBlocked(summary) {
+  const s = String(summary || '').trim();
+  if (!s) return false;
+  return loadBlocklist().some((x) => similarSummary(x.summary, s));
+}
+
 function nowIso() {
   return new Date().toISOString();
 }
@@ -136,6 +180,7 @@ async function addPref({ summary, tags, paths, pinned, source } = {}) {
     updatedAt: nowIso()
   });
   if (!pref) throw new Error('请填写偏好内容');
+  if (source === 'auto' && isPrefBlocked(pref.summary)) return null;
   const hit = store.prefs.find((x) => x.summary === pref.summary);
   if (hit) {
     hit.updatedAt = nowIso();
@@ -153,6 +198,8 @@ async function addPref({ summary, tags, paths, pinned, source } = {}) {
 
 function removePref(id) {
   const store = load();
+  const target = store.prefs.find((x) => x.id === id);
+  if (target) pushBlocklist(target);
   store.prefs = store.prefs.filter((x) => x.id !== id);
   save(store);
   retrieve.removeVector(vectorsPath(), id);

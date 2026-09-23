@@ -163,6 +163,7 @@ function mergeEntries(workspace, incoming, { source = 'auto' } = {}) {
       updatedAt: nowIso()
     });
     if (!item) continue;
+    if (source === 'auto' && isAutoBlocked(workspace, item.summary, item.paths)) continue;
     const hit = store.entries.find((e) =>
       !e.superseded
       && similarSummary(e.summary, item.summary)
@@ -210,15 +211,100 @@ function setPinned(workspace, id, pinned) {
   return e;
 }
 
+function blocklistPath(workspace) {
+  const dir = memoryDir(workspace);
+  return dir ? path.join(dir, 'deleted-blocklist.json') : null;
+}
+
+const BLOCKLIST_MAX = 200;
+
+function loadBlocklist(workspace) {
+  const p = blocklistPath(workspace);
+  if (!p || !fs.existsSync(p)) return [];
+  try {
+    const data = JSON.parse(fs.readFileSync(p, 'utf8'));
+    return Array.isArray(data?.items) ? data.items : [];
+  } catch {
+    return [];
+  }
+}
+
+// 用户手动删过的记忆：自动提炼不得再次写入（用户新建除外）
+function pushBlocklist(workspace, entry) {
+  const p = blocklistPath(workspace);
+  if (!p || !entry) return;
+  ensureDir(workspace);
+  const items = loadBlocklist(workspace);
+  items.push({
+    summary: String(entry.summary || '').slice(0, 400),
+    paths: normalizePaths(entry.paths),
+    deletedAt: nowIso(),
+    id: String(entry.id || '')
+  });
+  fs.writeFileSync(p, JSON.stringify({ version: 1, items: items.slice(-BLOCKLIST_MAX) }, null, 2), 'utf8');
+}
+
+function isAutoBlocked(workspace, summary, paths) {
+  const items = loadBlocklist(workspace);
+  for (const x of items) {
+    if (!similarSummary(x.summary, summary)) continue;
+    if (pathOverlap(x.paths, paths) || (!normalizePaths(x.paths).length && !normalizePaths(paths).length)) return true;
+  }
+  return false;
+}
+
 function remove(workspace, id) {
   const store = load(workspace);
   const idx = store.entries.findIndex((x) => x.id === id);
   if (idx < 0) throw new Error('记忆不存在');
   const [gone] = store.entries.splice(idx, 1);
-  appendArchive(workspace, [{ ...gone, deletedAt: nowIso() }]);
+  appendArchive(workspace, [{ ...gone, deletedAt: nowIso(), userDeleted: true }]);
+  pushBlocklist(workspace, gone);
   save(workspace, store);
   retrieve.removeVector(vectorsPath(workspace), id);
   return true;
+}
+
+/** 批量删除；返回实际删除条数 */
+function removeMany(workspace, ids) {
+  if (!workspace) throw new Error('请先打开项目');
+  const want = new Set((ids || []).map(String).filter(Boolean));
+  if (!want.size) return 0;
+  const store = load(workspace);
+  const gone = [];
+  store.entries = store.entries.filter((e) => {
+    if (!want.has(e.id)) return true;
+    gone.push(e);
+    return false;
+  });
+  if (!gone.length) return 0;
+  appendArchive(workspace, gone.map((e) => ({ ...e, deletedAt: nowIso(), userDeleted: true })));
+  for (const e of gone) {
+    pushBlocklist(workspace, e);
+    retrieve.removeVector(vectorsPath(workspace), e.id);
+  }
+  save(workspace, store);
+  return gone.length;
+}
+
+/**
+ * 清空项目长期记忆
+ * @param {{ keepPinned?: boolean }} opts keepPinned=true 时保留钉住的条目
+ */
+function clearAll(workspace, { keepPinned = false } = {}) {
+  if (!workspace) throw new Error('请先打开项目');
+  const store = load(workspace);
+  const gone = store.entries.filter((e) => !e.superseded && (!keepPinned || !e.pinned));
+  if (!gone.length) return 0;
+  const removeIds = new Set(gone.map((e) => e.id));
+  store.entries = store.entries.filter((e) => !removeIds.has(e.id));
+  appendArchive(workspace, gone.map((e) => ({ ...e, deletedAt: nowIso(), userDeleted: true })));
+  for (const e of gone) {
+    pushBlocklist(workspace, e);
+    retrieve.removeVector(vectorsPath(workspace), e.id);
+  }
+  save(workspace, store);
+  return gone.length;
 }
 
 /**
@@ -369,6 +455,8 @@ module.exports = {
   addUserMemory,
   setPinned,
   remove,
+  removeMany,
+  clearAll,
   recall,
   recallSync,
   formatForPrompt,

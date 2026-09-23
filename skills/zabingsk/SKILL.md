@@ -1,20 +1,46 @@
-# 新技能
-
 ---
-name: zabing-skill
+name: zabingsk-skill
 description: >-
-  Personal control skill that consolidates concise replies, confirm-before-code
-  (复述不隐藏关键消息), Chinese comments/labels, anti-garbled encoding (代码不能出现乱码),
-  禁止捡芝麻丢西瓜, and best-pick regression anti-forget. Use for every response;
-  when implementing or changing code; when writing comments, JSDoc/XML tags,
-  Header("...") text; when preventing mojibake / `?` corruption; when optimizing
-  without breaking established correct behavior; when changing 最佳建议号 /
-  predict.js ranking; or when the user asks to 复述流程 / update zabing-skill rules.
+  **权威技能，未弃用。** zabingsk 个人工作流：NewSlg 改代码前跑 zabingsk-alive.ps1；
+  简洁、先复述再动手、K 方案、中文注释、防乱码、禁止捡芝麻丢西瓜。zai 已停用。
+  实现/修 bug/改 Unity 时必须先 Read 本技能；与 ~/.cursor/rules/zabing-*.mdc 同步维护。
 ---
+开始改代码之后就不要重复规划了
+规划这些只应该在开始改代码之前规划好
 
-# zabing-skill
+# zabingsk-skill（权威 · 未弃用）
 
-个人统一控制技能。以后只维护本文件；模块可增删改。
+## 红线（用户永久规定 · 禁止弃用）
+
+**`zabingsk-skill` 禁止弃用。** 不得标 DEPRECATED、不得写「已迁移至 rules only」、不得删正文改 stub、不得对人说「技能已作废」。  
+`zabing-*.mdc` 是注入摘要，**不能**替代本技能。增删工作流：**先改本文件**，再同步 rules。
+
+个人统一控制技能。正文路径：`D:\SpCode\skills\zabingsk\SKILL.md`（与 Cursor `~/.cursor/skills/zabing-skill/`、`zabingsk/` 同文）。
+
+## 绝对优先级（高于一切其他设置）
+
+**zabingsk（本技能 + `zabing-*.mdc` + `zabingsk-alive.ps1`）权级最高**，高于且冲突时覆盖：
+
+- 模型/Cursor 默认习惯（如「报 bug 立刻改」「主动优化」「少步骤」）
+- 同轮或历史对话里未再次确认的「开始」
+- 其他 user rules、AGENTS.md、项目 `.mdc`（**git 禁令、服务端数据权威**等安全红线仍并行，但**改盘流程**以 zabingsk 为准）
+- 子代理/Task 的即兴流程
+
+**硬闸门**：未在本轮消息明确「开始」（或同条已写直接开始）→ **禁止**改仓库内 Unity/脚本/场景/prefab/配置；只允许读、解释、复述、K 方案。  
+**报 bug、贴图、催进度、续聊 ≠ 开始。**
+
+冲突时：**停手 → 复述 → 等「开始」**；不得用「效率」绕过。
+
+## 开工到家（zabingsk 唯一入口 · zai 已停用）
+
+NewSlg 改 Unity 前**只跑**（规则存活 + 项目红线，**不**跑 wake/body）：
+
+```
+powershell -NoProfile -ExecutionPolicy Bypass -File E:\NewSlg\project-scripts\zabingsk-alive.ps1
+```
+
+通过 → 对用户说「zabingsk 到家检测 OK」，再干活；失败 → 告诉人并停手。见 `~/.cursor/rules/zabing-workflow.mdc`。
+
 
 ## 模块索引
 
@@ -26,6 +52,8 @@ description: >-
 | D 防乱码与问号 | **代码不能出现乱码**；防止文案/`?` 损坏 |
 | E 禁止捡芝麻丢西瓜 | 局部优化不得毁掉已正确的大局/原规则 |
 | F 开发完一个功能之后需要做一个冒烟测试 |
+| H 代码可读性 / 一目了然 | 禁复杂嵌套、禁 lambda、主界面引用加 Header、注释齐全 |
+| I 禁用正则大段替换 | 改代码文件必须 IndexOf+Substring 精准替换，禁 PowerShell/正则大段替换；读不全不整写 |
 
 ---
 
@@ -43,7 +71,7 @@ description: >-
 流程1--->流程2--->流程3----->流程4
 
 把步骤名换成实际名称；用 `--->`（或用户示例的箭头链）连接，单行输出。
-
+禁止出现幻觉和字段猜测
 ### 示例
 
 **用户**：复述一下部署流程。  
@@ -74,6 +102,20 @@ description: >-
 3. **开始**：仅当用户明确表示可动手后再实现。认可用语：`开始`、`可以开始`、`动手`、`干吧`、`start`、`go`、`do it`、`结合你的复述开始` 等。
 4. **按复述执行**：用户回复「开始」时，**默认按刚才那次复述**动手，不必再确认；「结合你的复述开始」等同。若复述后用户又改了需求，以最新复述为准。
 5. **需求变更**：用户改了需求或纠正理解 → 重新简洁复述，再次等确认后再继续。
+
+### 大脑与实现端的交接流程
+
+本流程适用于所有由大脑分析、实现端执行的任务，不绑定 hy3 或任何特定模型、脚本、代理。
+
+1. **大脑理解并定方案**：大脑读项目地图和必要源码，明确目标、范围、约束、验收点，形成可执行方案。
+2. **完整派单**：大脑把文件路径、方法名与行号、当前行为、目标行为、实施步骤、验收标准和禁止改动范围一次写全，禁止只发「修一下」之类模糊指令。
+3. **复述后执行**：用户说「开始」即已授权，不必再让用户确认。实现端收到派单后先按当前技能复述自己的理解与实施步骤（只读，不改文件）；大脑核对无误并给出内部「开始」授权后，实现端立即动手改、测试并回报。此后不得反复循环迭代需求、不得要求用户重复确认。
+4. **只在有分歧时停手**：实现端遇到信息不足、业务语义不明、项目地图查不到、源码无法完整读取或方案有多种走法时，禁止猜改；先查项目地图、再精确读源码，仍不明确则停手报告大脑，由大脑整理后转交用户，用户给出方案后再继续执行。
+5. **大脑验收**：实现端回报后，大脑回读或检查改动，确认与方案一致后再向用户交付。
+
+流程：用户提需求--->大脑理解并定方案--->完整派单--->实现端复述理解--->大脑核对并授权--->实现端执行改动与测试--->大脑回读验收--->交付
+
+交接只是分工与验收，不是能力边界：大脑与实现端都能读源码、改文件、跑命令，任何一方不得以「没有写入工具 / 无法改文件」为由停手，更不得谎称已经写入。
 
 ### 复述要求
 
@@ -159,7 +201,7 @@ Header("用户列表");
 ### 示例
 
 ```cs
-// 错误：Header("???"); 或 // æ£€æŸ¥ç©ºå€¼ 或 //        
+// 错误：Header("???"); 或 // æ£€æŸ¥ç©ºå€¤ 或 //        
 // 正确：Header("设置"); 或 // 校验空值
 ```
 
@@ -221,8 +263,81 @@ Header("用户列表");
 
 ---
 
+## H. 代码可读性 / 一目了然
+
+**代码必须让人一眼看懂，宁可长，不可绕。**
+
+### 规则
+
+1. **禁止复杂嵌套、绕来绕去**：不要把简单逻辑写成多层 `if/for` 套娃、深递归、连环三元、链式回调、状态机套娃。能直白写就直白写；一个方法只做一件事，长一点没关系。
+2. **禁止使用 lambda 表达式**：不写 `=>` 箭头函数 / 匿名委托 / 内联闭包 / `linq` 链式 `Where/Select/FirstOrDefault` 等。需要回调或条件筛选就写具名方法或显式 `for` 循环，可读性优先。
+3. **代码可以长，但必须一目了然**：允许方法体偏长、步骤拆得多，但每一步都要直白、命名清晰、有中文注释，读下来不需要脑补。
+4. **主界面引用必须加 Header**：`MainGuanliManager` 等主管理器 / 主界面控制脚本里，所有被外部引用或 Inspector 绑定的 `public` 字段（GameObject / Transform / 组件 / 配置对象等），必须用 `[Header("中文说明")]` 标注，说明这个引用是干什么的。例：`[Header("中部UI")] public GameObject zhongBuUi;`
+5. **功能代码注释写齐全**：写了功能逻辑的地方，注释不能省——说明「做什么 / 为什么 / 关键边界」。与 C 模块联动：一律中文、禁止占位符（`TODO`/`FIXME`/`xxx`/`...` 等空壳一律不许）。
+
+### 示例
+
+```cs
+// 错误：嵌套 + lambda + 无注释，看不懂在干什么
+var x = list.Where(a => a.active).Select(a => a.transform).FirstOrDefault(t => t != null);
+```
+
+```cs
+// 正确：直白、具名、有注释，一眼看懂
+// 从列表里找出第一个处于激活状态、且带有有效变换组件的对象
+Transform zhaoDaoDeTransform = null;
+for (int i = 0; i < list.Count; i++)
+{
+    if (list[i].active == false)
+    {
+        continue;
+    }
+    if (list[i].transform == null)
+    {
+        continue;
+    }
+    zhaoDaoDeTransform = list[i].transform;
+    break;
+}
+```
+
+```cs
+// 错误：主界面引用无 Header，Inspector 里一片变量名，不知用途
+public GameObject zhongBuUi;
+public GameObject dingBuUi;
+
+// 正确：加 Header 标明用途
+[Header("中部UI")]
+public GameObject zhongBuUi;
+[Header("顶部UI")]
+public GameObject dingBuUi;
+```
+
+---
+
+## I. 禁用正则大段替换 / 精准编辑
+
+**改代码文件（Unity/脚本/场景/prefab/配置等）必须逐字符精准定位替换，禁止用正则或大段替换把文件改坏。**
+
+### 规则
+
+1. **精准替换**：修改已有代码文件，一律先用 `IndexOf` 找到唯一锚点，再用 `Substring` 拼接出新内容做局部替换；**禁止** PowerShell `[Regex]::Replace` / `[Regex]::Escape`、`sed -i`、`string.Replace(大段)` 等会跨行失控的写法。锚点串若含换行，必须逐行精确匹配，不得交给正则引擎自由扩展。
+2. **读不全不整写**：`read_file` 被截断、无法完整取回目标文件原文时，**禁止整写补全或自行重建**，必须停下，如实告知用户「读不到完整文件」，改为向用户索取原稿或客户端快照。推断稿不得冒充原稿。
+3. **损坏即报告**：若因替换失控导致文件被撑爆/重复/结构破坏，视为严重失误，必须立刻如实报告（不得掩盖），并走恢复路径：优先 SimpleCode 客户端文件历史还原快照；无快照则向用户要原稿。
+
+### 根因回顾（WlCityReply.cs 事故）
+
+本轮用 PowerShell `[Regex]::Replace` + `[Regex]::Escape` 去改 `WlCityReply.cs` 的两处编译错误，方法串含换行，`Escape` 生成跨大段匹配模式，把 structs 块反复复制，文件从约 558 行撑爆至约 85000 行，整文件结构破坏、无法从磁盘抢救。教训：多行锚点绝不用正则大段替换；读不全就不整写；损坏立刻报告而非继续修补。
+
+### 示例
+
+**错误**：用 `[Regex]::Replace $c '[escaped multi-line anchor]' '...'` 改源码。  
+**正确**：`int i = content.IndexOf("唯一锚点串"); string newContent = content.Substring(0, i) + "替换段" + content.Substring(i + 锚点长度);`
+
+---
+
 ## 维护说明
 
-- 增删规则：只改本 `SKILL.md` 对应模块。
-- 旧技能目录可删除：`chinese-comments`、`confirm-before-code`、`concise-reply`（删除后仅本技能生效）。
-- 新增个人规则：在「模块索引」加一行，并新增对应章节。
+- 增删规则：改 `D:\SpCode\skills\zabingsk\SKILL.md`，并同步 `~/.cursor/skills/zabing-skill/` 与 `~/.cursor/skills/zabingsk/`。
+- 同步刷新 `~/.cursor/rules/zabing-*.mdc` 摘要（需要时）。
+- **zabingsk-skill 永不标弃用**；弃用的是 zai / 旧拆分技能，不是本技能。

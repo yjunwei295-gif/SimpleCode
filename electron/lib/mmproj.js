@@ -103,7 +103,7 @@ async function downloadFor(modelName, dir, onStatus) {
     extras.push('bartowski/Qwen3-VL-4B-Instruct-GGUF', 'ggml-org/Qwen3-VL-4B-Instruct-GGUF', 'Qwen/Qwen3-VL-4B-Instruct-GGUF');
   }
   if (/qwen2\.5-vl-7b/i.test(modelName)) extras.push('bartowski/Qwen2.5-VL-7B-Instruct-GGUF');
-  if (/qwen2\.5-vl-3b/i.test(modelName)) extras.push('bartowski/Qwen2.5-VL-3B-Instruct-GGUF');
+  if (/qwen2\.5-vl-3b/i.test(modelName)) extras.push('lmstudio-community/Qwen2.5-VL-3B-Instruct-GGUF');
 
   let source = await downloader.resolveSource();
   let repos = [];

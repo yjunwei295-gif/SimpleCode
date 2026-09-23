@@ -1,6 +1,37 @@
 const fs = require('fs');
 const path = require('path');
 
+// 解析 SKILL.md 开头的 YAML 头：取出 description，避免第一行是 --- 时列表描述空白
+function parseSkillMeta(body) {
+  const text = String(body || '');
+  const m = text.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
+  if (!m) return {};
+  const out = {};
+  const lines = m[1].split(/\r?\n/);
+  let key = '';
+  let acc = [];
+  const flush = () => {
+    if (!key) return;
+    out[key] = acc.join('\n').replace(/\s+/g, ' ').trim();
+    key = '';
+    acc = [];
+  };
+  for (const line of lines) {
+    const kv = line.match(/^([A-Za-z_][\w-]*)\s*:\s*(.*)$/);
+    if (kv) {
+      flush();
+      key = kv[1].toLowerCase();
+      const rest = String(kv[2] || '').trim();
+      if (rest === '>' || rest === '>-' || rest === '|' || rest === '|-') acc = [];
+      else acc = [rest.replace(/^["']|["']$/g, '')];
+    } else if (key) {
+      acc.push(line.replace(/^\s+/, ''));
+    }
+  }
+  flush();
+  return out;
+}
+
 function readSkillDir(dir, scope) {
   if (!dir || !fs.existsSync(dir)) return [];
   const items = [];
@@ -17,8 +48,14 @@ function readSkillDir(dir, scope) {
     if (!md || !fs.existsSync(md)) continue;
     const body = fs.readFileSync(md, 'utf8');
     const name = ent.isDirectory() ? ent.name : path.basename(ent.name, '.md');
-    const first = body.split(/\r?\n/).find((l) => l.trim()) || name;
-    const desc = first.replace(/^#\s*/, '').trim();
+    const meta = parseSkillMeta(body);
+    const first = body.split(/\r?\n/).find((l) => {
+      const s = l.trim();
+      return s && s !== '---' && !/^[A-Za-z_][\w-]*\s*:/.test(s) && s !== '>' && s !== '>-';
+    }) || '';
+    const desc = (meta.description || meta.desc || '').trim()
+      || first.replace(/^#\s*/, '').trim()
+      || name;
     items.push({ id: name, name, desc, body, file: md, scope });
   }
   return items;
@@ -212,6 +249,6 @@ function savePersona(appRoot, body) {
 }
 
 module.exports = {
-  loadAll, listDetailed, saveSkill, deleteSkill,
+  loadAll, listDetailed, saveSkill, deleteSkill, parseSkillMeta,
   loadRules, saveRule, deleteRule, loadPersona, savePersona
 };

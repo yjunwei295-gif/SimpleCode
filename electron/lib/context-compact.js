@@ -102,6 +102,137 @@ function splitHistory(history, keepTurns = KEEP_TURNS) {
   };
 }
 
+const KEEP_ASST_CHARS = 2500;
+const KEEP_USER_CHARS = 4000;
+const TOOL_RESULT_CAP = 8000;
+const OLD_TOOL_CHARS = 400;
+
+// 本地裁历史：只留最近几轮全文，更早的用户原话收成摘要。不调模型，避免再等一轮。
+function trimHistoryLocal(history, contextSummary) {
+  const { older, keep } = splitHistory(history);
+  const clipped = (keep || []).map((m) => {
+    const t = String(m.content || m.text || '');
+    const cap = m.role === 'assistant' ? KEEP_ASST_CHARS : KEEP_USER_CHARS;
+    if (t.length <= cap) return { role: m.role, content: t };
+    if (t.includes('【文件】') || t.includes('【全文】')) return { role: m.role, content: t };
+    return { role: m.role, content: t.slice(0, cap) + '\n…（本条已截断）' };
+  });
+  if (!older.length) {
+    return { history: clipped, contextSummary: String(contextSummary || ''), didTrim: clipped.length !== (history || []).length };
+  }
+  const userBits = [];
+  for (const m of older) {
+    if (m.role !== 'user') continue;
+    const t = String(m.content || m.text || '').replace(/\s+/g, ' ').trim();
+    if (t) userBits.push('- ' + t.slice(0, 180));
+  }
+  const digest = userBits.slice(-24).join('\n');
+  const next = [String(contextSummary || '').trim(), digest ? ('更早用户原话：\n' + digest) : ''].filter(Boolean).join('\n').slice(0, SUMMARY_MAX);
+  return { history: clipped, contextSummary: next, didTrim: true };
+}
+
+function toolResultKey(name, args) {
+  const n = String(name || '');
+  const a = args || {};
+  if (n === 'read_file') {
+    return 'read|' + String(a.path || '').replace(/\\/g, '/').toLowerCase() + '|' + (Number(a.startLine) || 0) + '|' + (Number(a.endLine) || 0);
+  }
+  if (n === 'search_text' || n === 'map_lookup' || n === 'semantic_search' || n === 'goto_definition') {
+    return n + '|' + String(a.query || a.q || '') + '|' + String(a.path || a.module || '');
+  }
+  if (n === 'list_dir') {
+    return 'list|' + String(a.path || '') + '|' + String(a.query || '');
+  }
+  return '';
+}
+
+function clipToolResult(name, args, result, seen) {
+  const key = toolResultKey(name, args);
+  if (key && seen && seen.has(key)) {
+    return '（与本轮先前同参数的结果相同，未重复附上。若要看细节，请换 startLine/endLine 或换关键词。）';
+  }
+  let text = String(result ?? '');
+  // 读文件的结果原样交给模型，截断标记会让它把半截内容当成全文
+  const isRead = String(name || '') === 'read_file';
+  if (!isRead && text.length > TOOL_RESULT_CAP) {
+    text = text.slice(0, TOOL_RESULT_CAP) + '\n…（已截断，请缩小范围再读）';
+  }
+  if (key && seen) seen.set(key, true);
+  return text;
+}
+
+// 本轮较早的工具结果压短，下一轮请求不再带着整份大文件
+function shrinkOlderToolMessages(messages, keepLast) {
+  const keep = keepLast == null ? 2 : keepLast;
+  const list = messages || [];
+  const toolIdx = [];
+  list.forEach((m, i) => { if (m && m.role === 'tool') toolIdx.push(i); });
+  const keepFrom = toolIdx.length > keep ? toolIdx[toolIdx.length - keep] : -1;
+  for (let i = 0; i < list.length; i++) {
+    const m = list[i];
+    if (!m || m.role !== 'tool' || i >= keepFrom) continue;
+    const t = String(m.content || '');
+    if (t.includes('【文件】') || t.includes('【全文】')) continue;
+    if (t.length > OLD_TOOL_CHARS) m.content = t.slice(0, OLD_TOOL_CHARS) + '\n…（较早的工具结果已省略）';
+  }
+  return list;
+}
+
+// 与 Cursor 同轮策略一致：只读可并行，写入/删除/命令/提问必须串行
+const PARALLEL_TOOLS = new Set([
+  'read_file',
+  'list_dir',
+  'search_text',
+  'semantic_search',
+  'map_lookup',
+  'goto_definition',
+  'memory_list'
+]);
+
+function isParallelTool(name) {
+  return PARALLEL_TOOLS.has(String(name || ''));
+}
+
+// 改代码才算实现；思考轮数只卡只读，一旦写/删/建目录就不再吃用户设的轮数上限
+const IMPLEMENT_TOOLS = new Set([
+  'write_file',
+  'delete_file',
+  'create_dir',
+  'mkdir'
+]);
+
+function isImplementTool(name) {
+  return IMPLEMENT_TOOLS.has(String(name || ''));
+}
+
+function callsIncludeImplement(calls) {
+  return (calls || []).some((tc) => isImplementTool(tc?.function?.name || tc?.name || ''));
+}
+
+/** 思考预算：未开始改代码时，thinkUsed 用尽就该收尾；实现中始终放开（另有安全上限） */
+function thinkBudgetOpen({ thinkUsed, thinkLimit, implementing }) {
+  if (implementing) return true;
+  const used = Number(thinkUsed) || 0;
+  const limit = Number(thinkLimit) || 0;
+  return used < limit;
+}
+
+/**
+ * 把本轮 tool_calls 按「连续只读 = 一波并行，遇写入则切断」切开。
+ * 例：[read, read, write, read] → 三波。
+ */
+function splitToolWaves(calls) {
+  const waves = [];
+  for (const tc of calls || []) {
+    const name = tc?.function?.name || tc?.name || '';
+    const parallel = isParallelTool(name);
+    const last = waves[waves.length - 1];
+    if (parallel && last && last.parallel) last.calls.push(tc);
+    else waves.push({ parallel, calls: [tc] });
+  }
+  return waves;
+}
+
 function formatDialog(messages) {
   return (messages || []).map((m) => {
     const role = m.role === 'user' ? '用户' : '助手';
@@ -198,6 +329,7 @@ function pickSummaryCfg(vs, primaryCfg) {
 module.exports = {
   SOFT_LIMIT,
   KEEP_TURNS,
+  TOOL_RESULT_CAP,
   emptyWorking,
   normalizeWorking,
   formatWorking,
@@ -205,6 +337,17 @@ module.exports = {
   estimateSize,
   needsCompact,
   splitHistory,
+  trimHistoryLocal,
+  toolResultKey,
+  clipToolResult,
+  shrinkOlderToolMessages,
+  PARALLEL_TOOLS,
+  isParallelTool,
+  IMPLEMENT_TOOLS,
+  isImplementTool,
+  callsIncludeImplement,
+  thinkBudgetOpen,
+  splitToolWaves,
   compactHistory,
   formatSummaryForPrompt,
   isContextOverflowError,

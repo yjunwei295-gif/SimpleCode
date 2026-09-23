@@ -1,4 +1,7 @@
 const path = require('path');
+const { httpFetch } = require('./http-fetch');
+const localLlm = require('./local-llm');
+const imageGenEngine = require('./image-gen-engine');
 
 const DEFAULTS = {
   imageGen: { size: '1024x1024', paths: ['images/generations'] },
@@ -11,6 +14,9 @@ function isApiCfg(modelCfg) {
 }
 
 function localGenHint(roleName) {
+  if (roleName === '生图') {
+    return '未找到可用的本地生图模型。请把 Qwen-Image / FLUX / SD 等 .gguf 下载到模型目录，并在「文件 → 模型组合」挂到生图槽位；首次运行会自动下载生图引擎与配套文件。';
+  }
   return `本地 GGUF 不能${roleName}。请在「文件 → 模型组合」把该槽位改挂接口模型。`;
 }
 
@@ -29,7 +35,7 @@ async function postJson(modelCfg, relPath, body, signal) {
   }
   const timer = setTimeout(() => ctl.abort(), 8 * 60 * 1000);
   try {
-    const res = await fetch(url, {
+    const res = await httpFetch(url, {
       method: 'POST',
       headers,
       body: JSON.stringify(body),
@@ -77,7 +83,7 @@ async function fromUrl(fileUrl, fallbackExt, signal) {
   }
   const timer = setTimeout(() => ctl.abort(), 8 * 60 * 1000);
   try {
-    const res = await fetch(fileUrl, { signal: ctl.signal });
+    const res = await httpFetch(fileUrl, { signal: ctl.signal });
     if (!res.ok) throw new Error(`下载生成文件失败（HTTP ${res.status}）`);
     const mime = res.headers.get('content-type') || '';
     const buf = Buffer.from(await res.arrayBuffer());
@@ -131,6 +137,9 @@ function errText(hit) {
   if (msg) return String(msg);
   const t = String(hit.text || '').trim();
   if (t && t.length < 400) return t;
+  if (hit.status === 401) {
+    return 'HTTP 401（接口鉴权失败：请检查「设置→模型管理」里该 API 的密钥/地址，或改在「文件→模型组合→生图」挂本地 GGUF）';
+  }
   return `HTTP ${hit.status}`;
 }
 
@@ -156,7 +165,15 @@ async function tryPaths(modelCfg, paths, body, fallbackExt, signal) {
  * 用接口模型生成媒体文件
  * @returns {{ buf: Buffer, ext: string }}
  */
-async function generateMedia({ role, modelCfg, prompt, signal }) {
+async function generateMedia({ role, modelCfg, prompt, signal, modelsDir, onWait }) {
+  if (role === 'imageGen') {
+    const modelPath = localLlm.resolveGgufPath(modelCfg, modelsDir);
+    const looksLocal = modelCfg?.type === 'local' || modelPath || /\.gguf$/i.test(modelCfg?.model || '');
+    if (looksLocal) {
+      if (!modelPath) throw new Error(localGenHint('生图'));
+      return imageGenEngine.generate({ modelPath, prompt, modelsDir, onWait, signal });
+    }
+  }
   if (!isApiCfg(modelCfg)) {
     const names = { imageGen: '生图', videoGen: '生视频', model3d: '生 3D' };
     throw new Error(localGenHint(names[role] || '生成'));

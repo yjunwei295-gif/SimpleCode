@@ -1,5 +1,5 @@
 const {
-  app, BrowserWindow, ipcMain, dialog, nativeTheme, clipboard, shell, crashReporter
+  app, BrowserWindow, ipcMain, dialog, nativeTheme, clipboard, shell, crashReporter, session
 } = require('electron');
 const path = require('path');
 const fs = require('fs');
@@ -10,25 +10,89 @@ const snapshot = require('./lib/snapshot');
 const agent = require('./lib/agent');
 const skillsLib = require('./lib/skills');
 const localLlm = require('./lib/local-llm');
+const zbaingAi = require('./lib/zbaingAi');
 const diag = require('./lib/diag');
 const downloader = require('./lib/downloader');
 const hardware = require('./lib/hardware');
+const modelMeta = require('./lib/model-meta');
 const assembly = require('./lib/assembly');
 const { migrateUserData } = require('./lib/migrate-userdata');
 const mmprojLib = require('./lib/mmproj');
 const visionEngine = require('./lib/vision-engine');
+const memory = require('./lib/memory');
+const memoryGlobal = require('./lib/memory-global');
+const apiProtocol = require('./lib/api-protocol');
+const { applyProxy } = require('./lib/http-fetch');
+const milestone = require('./lib/milestone');
+const codeIndex = require('./lib/code-index');
+const codeEmbed = require('./lib/code-embed');
+const desktopHand = require('./lib/desktop-hand');
 const { parseAttachment, isDocumentExt } = require('./lib/media');
-const { listTree, listChildren, readForPreview, safeJoin, SKIP } = require('./lib/workspace');
+// 文件树、@ 搜索、预览都走这里。漏导入时列目录会抛错，侧栏被收成空目录
+const {
+  listTree, listChildren, readForPreview, SKIP,
+  isAbsPath, extraRoots, resolveRead
+} = require('./lib/workspace');
+function listLocalFilesEnriched(dir) {
+  return localLlm.listGguf(dir).map((f) => modelMeta.enrichFile(dir, f, { writeBack: true }));
+}
 
-const APP_ROOT = path.join(__dirname, '..');
+/** 开发态=仓库根；打包后=userData/app-root（可写 skills/rules/persona） */
+let APP_ROOT = path.join(__dirname, '..');
+/** 代码/资源根（asar 内只读即可：图标、renderer） */
+const CODE_ROOT = path.join(__dirname, '..');
 const windows = new Set();
 const workspaceByWin = new WeakMap();
+/** win -> Map(turnId, AbortController) */
 const abortByWin = new WeakMap();
+/** win -> Map(turnId, { resolve, reject, ask }) */
+const pendingAskByWin = new WeakMap();
 const watchByWin = new WeakMap();
+
+function abortMap(win) {
+  let m = abortByWin.get(win);
+  if (!m) {
+    m = new Map();
+    abortByWin.set(win, m);
+  }
+  return m;
+}
+
+function pendingAskMap(win) {
+  let m = pendingAskByWin.get(win);
+  if (!m) {
+    m = new Map();
+    pendingAskByWin.set(win, m);
+  }
+  return m;
+}
 
 // 视觉代理启动状态（主进程内记录，重启后重新按需启动）
 let visionStarted = false;
 let visionStartError = '';
+
+function ensureAppRoot() {
+  if (!app.isPackaged) {
+    APP_ROOT = CODE_ROOT;
+    return APP_ROOT;
+  }
+  const dest = path.join(app.getPath('userData'), 'app-root');
+  const marker = path.join(dest, '.seeded');
+  const src = path.join(process.resourcesPath, 'app-root');
+  fs.mkdirSync(dest, { recursive: true });
+  if (!fs.existsSync(marker)) {
+    try {
+      if (fs.existsSync(src)) fs.cpSync(src, dest, { recursive: true });
+    } catch (e) {
+      diag.log('app', '种子 app-root 失败', { message: e && e.message });
+    }
+    fs.mkdirSync(path.join(dest, 'skills'), { recursive: true });
+    fs.mkdirSync(path.join(dest, 'rules'), { recursive: true });
+    try { fs.writeFileSync(marker, new Date().toISOString(), 'utf8'); } catch { /* ignore */ }
+  }
+  APP_ROOT = dest;
+  return APP_ROOT;
+}
 
 function sessionDir() {
   return path.join(app.getPath('userData'), 'sessions');
@@ -45,7 +109,7 @@ function createWindow() {
     minWidth: 900,
     minHeight: 600,
     frame: false,
-    icon: path.join(APP_ROOT, 'icons.png'),
+    icon: path.join(CODE_ROOT, 'icons.png'),
     backgroundColor: nativeTheme.shouldUseDarkColors ? '#141414' : '#f3f3f3',
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
@@ -73,7 +137,7 @@ function createWindow() {
       sendTo(win, 'ui:refresh', {});
     }
   });
-  win.loadFile(path.join(__dirname, '..', 'renderer', 'index.html'));
+  win.loadFile(path.join(CODE_ROOT, 'renderer', 'index.html'));
   return win;
 }
 
@@ -126,6 +190,15 @@ function addRecent(dir) {
   s.recents = [{ name, path: dir, openedAt: Date.now() }, ...s.recents.filter((r) => r.path !== dir)].slice(0, 20);
   store.save(s);
 }
+
+codeIndex.onStatus((st) => {
+  for (const win of windows) {
+    const ws = workspaceByWin.get(win) || '';
+    if (ws && st?.workspace && codeIndex.sameWorkspace(ws, st.workspace)) {
+      sendTo(win, 'index:progress', st);
+    }
+  }
+});
 
 // 崩溃诊断：闪退时窗口和控制台一起消失，只能靠这份日志回溯
 // 本地留存崩溃转储，用来区分「原生崩溃」和「被外部杀掉」
@@ -200,11 +273,22 @@ ipcMain.on('log:client', (_e, payload) => {
   diag.log('renderer', (payload && payload.message) || '界面异常', payload && payload.detail);
 });
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
+  ensureAppRoot();
   diag.log('app', `诊断日志位置：${diag.logFile()}`);
+  diag.log('app', `APP_ROOT=${APP_ROOT}`, { packaged: app.isPackaged });
+  try {
+    const s = store.load();
+    const proxy = await applyProxy(session.defaultSession, s.proxy || '');
+    if (proxy.applied) diag.log('app', '已应用网络代理', { proxy: proxy.proxy });
+  } catch (e) {
+    diag.log('app', '应用代理失败', { message: e && e.message });
+  }
   reportPreviousCrashes();
   startHeartbeat();
   createWindow();
+  startClipboardWatch();
+  if (store.load().desktopAlive) desktopHand.setAlive(true);
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
@@ -212,6 +296,7 @@ app.whenReady().then(() => {
 
 app.on('window-all-closed', () => {
   diag.log('app', '所有窗口已关闭');
+  desktopHand.setAlive(false);
   if (process.platform !== 'darwin') app.quit();
 });
 
@@ -236,7 +321,7 @@ ipcMain.handle('app:state', async (e) => {
     modelsDir,
     workspace: workspaceByWin.get(win) || '',
     appRoot: APP_ROOT,
-    localFiles: localLlm.listGguf(modelsDir),
+    localFiles: listLocalFilesEnriched(modelsDir),
     assemblyKey: assembly.assemblyKey(s)
   };
 });
@@ -260,6 +345,47 @@ ipcMain.handle('app:searchSites', (_e, sites) => {
   s.searchSites = require('./lib/web-search').normalizeSites(sites);
   store.save(s);
   return s.searchSites;
+});
+
+ipcMain.handle('app:proxy', async (_e, proxy) => {
+  const s = store.load();
+  s.proxy = String(proxy || '').trim();
+  store.save(s);
+  try {
+    if (s.proxy) {
+      const r = await applyProxy(session.defaultSession, s.proxy);
+      return { proxy: s.proxy, applied: !!r.applied };
+    }
+    await session.defaultSession.setProxy({ mode: 'system' });
+    return { proxy: '', applied: false, mode: 'system' };
+  } catch (e) {
+    return { proxy: s.proxy, applied: false, error: e.message };
+  }
+});
+
+ipcMain.handle('app:commandSandbox', (_e, cfg) => {
+  const s = store.load();
+  s.commandSandbox = {
+    enabled: cfg?.enabled !== false,
+    timeoutSec: Math.max(3, Math.min(600, Number(cfg?.timeoutSec) || 60))
+  };
+  store.save(s);
+  return s.commandSandbox;
+});
+
+ipcMain.handle('app:maxAgentRounds', (_e, n) => {
+  const s = store.load();
+  s.maxAgentRounds = store.clampAgentRounds(n);
+  store.save(s);
+  return s.maxAgentRounds;
+});
+
+ipcMain.handle('desktop:setAlive', (_e, on) => {
+  const s = store.load();
+  s.desktopAlive = !!on;
+  store.save(s);
+  desktopHand.setAlive(s.desktopAlive);
+  return s.desktopAlive;
 });
 
 ipcMain.handle('window:new', () => {
@@ -300,40 +426,141 @@ ipcMain.handle('workspace:set', (e, dir) => {
   throw new Error('目录不存在');
 });
 
-ipcMain.handle('workspace:files', (e, query) => {
-  const ws = workspaceByWin.get(getWin(e));
-  if (!ws) return [];
-  return listTree(ws, { query: query || '', max: 200 });
+ipcMain.handle('index:status', (e) => {
+  const ws = workspaceByWin.get(getWin(e)) || '';
+  return codeIndex.getStatus(ws);
 });
 
-ipcMain.handle('workspace:children', (e, rel) => {
+ipcMain.handle('index:getMap', (e) => {
+  const ws = workspaceByWin.get(getWin(e)) || '';
+  if (!ws) return null;
+  return codeIndex.getMap ? codeIndex.getMap(ws) : null;
+});
+
+ipcMain.handle('index:getExcludes', (e) => {
+  const ws = workspaceByWin.get(getWin(e)) || '';
+  return codeIndex.getExcludes ? codeIndex.getExcludes(ws) : [];
+});
+
+ipcMain.handle('index:setExcludes', (e, ids) => {
+  const ws = workspaceByWin.get(getWin(e)) || '';
+  return codeIndex.setExcludes ? codeIndex.setExcludes(ws, ids) : [];
+});
+
+// 项目地图白名单：读取/保存 include 配置（只显示勾选的模块）
+ipcMain.handle('index:getInclude', (e) => {
+  const ws = workspaceByWin.get(getWin(e)) || '';
+  return codeIndex.getInclude ? codeIndex.getInclude(ws) : { initialized: false, includes: [] };
+});
+
+ipcMain.handle('index:setInclude', (e, obj) => {
+  const ws = workspaceByWin.get(getWin(e)) || '';
+  if (!codeIndex.setInclude) return { initialized: false, includes: [] };
+  const saved = codeIndex.setInclude(ws, obj);
+  // 保存白名单后后台归纳勾选模块的方法（名字+关键值+说明），不阻塞界面
+  if (ws && saved.includes.length && codeIndex.summarizeIncludes) {
+    const s = store.load();
+    const modelCfg = store.resolveModelCfg(s.currentModelId, s);
+    if (modelCfg) {
+      codeIndex.summarizeIncludes(ws, saved.includes, modelCfg)
+        .catch((err) => diag.log('map', '方法归纳失败', { message: err && err.message }));
+    }
+  }
+  return saved;
+});
+
+ipcMain.handle('index:summarizeOne', (e, id) => {
+  const ws = workspaceByWin.get(getWin(e)) || '';
+  if (!ws || !codeIndex.summarizeOne) return Promise.resolve({ ok: false, reason: 'no-map' });
+  const s = store.load();
+  const modelCfg = store.resolveModelCfg(s.currentModelId, s);
+  if (!modelCfg) return Promise.resolve({ ok: false, reason: 'no-model' });
+  return codeIndex.summarizeOne(ws, id, modelCfg);
+});
+
+ipcMain.handle('index:summarize', (e) => {
+  const ws = workspaceByWin.get(getWin(e)) || '';
+  if (!ws || !codeIndex.summarizeIncludes || !codeIndex.getInclude) return { ok: false };
+  const inc = codeIndex.getInclude(ws);
+  if (!inc || !inc.initialized || !inc.includes || !inc.includes.length) return { ok: false, reason: 'no-include' };
+  const s = store.load();
+  const modelCfg = store.resolveModelCfg(s.currentModelId, s);
+  if (!modelCfg) return { ok: false, reason: 'no-model' };
+  codeIndex.summarizeIncludes(ws, inc.includes, modelCfg)
+    .catch((err) => diag.log('map', '方法归纳失败', { message: err && err.message }));
+  return { ok: true };
+});
+
+ipcMain.handle('index:sync', (e, extraFolders) => {
+  const ws = workspaceByWin.get(getWin(e)) || '';
+  if (!ws) return codeIndex.getStatus('');
+  const extra = Array.isArray(extraFolders) ? extraFolders : [];
+  // 绘制只扫描依赖，不把聊天模型传进去做归纳
+  codeIndex.kickIndex(ws, extra, {});
+  codeEmbed.kickIndex(ws, extra);
+  return codeIndex.getStatus(ws);
+});
+
+ipcMain.handle('index:delete', async (e) => {
+  const ws = workspaceByWin.get(getWin(e)) || '';
+  if (!ws) return codeIndex.getStatus('');
+  return codeIndex.deleteIndex(ws);
+});
+
+ipcMain.handle('workspace:files', (e, payload) => {
+  const query = typeof payload === 'string' ? payload : (payload?.query || '');
+  const extras = Array.isArray(payload?.extraFolders) ? payload.extraFolders : [];
   const ws = workspaceByWin.get(getWin(e));
-  if (!ws) return [];
-  return listChildren(ws, rel || '');
+  const out = [];
+  if (ws) out.push(...listTree(ws, { query, max: 200 }));
+  for (const root of extras) {
+    if (!root || !fs.existsSync(root)) continue;
+    const files = listTree(root, { query, max: 80 });
+    for (const f of files) {
+      out.push({
+        path: path.join(root, f.path).replace(/\\/g, '/'),
+        name: f.name
+      });
+    }
+  }
+  return out;
+});
+
+ipcMain.handle('workspace:children', (e, payload) => {
+  const rel = typeof payload === 'string' ? payload : (payload?.rel || '');
+  const win = getWin(e);
+  const ws = workspaceByWin.get(win);
+  const root = (payload && typeof payload === 'object' && payload.root) || ws;
+  const absolute = !!(payload && typeof payload === 'object' && payload.absolute);
+  if (!root) return [];
+  return listChildren(root, rel || '', { absolute });
 });
 
 ipcMain.handle('workspace:read', async (e, rel) => {
-  const ws = workspaceByWin.get(getWin(e));
-  if (!ws) throw new Error('未打开项目');
-  const abs = safeJoin(ws, rel || '');
+  const ws = workspaceByWin.get(getWin(e)) || '';
+  if (!ws && !isAbsPath(rel)) throw new Error('未打开项目');
+  const extra = extraRoots(APP_ROOT, ws);
+  const abs = resolveRead(ws, extra, rel || '');
   const ext = path.extname(abs).toLowerCase();
+  const display = String(rel || '').replace(/\\/g, '/');
   if (isDocumentExt(ext)) {
     const parsed = await parseAttachment(abs);
     return {
       kind: 'document',
-      path: String(rel || '').replace(/\\/g, '/'),
+      path: display,
       name: parsed.name,
       content: parsed.text || '',
       images: (parsed.images || []).map((img) => ({ name: img.name, dataUrl: img.dataUrl }))
     };
   }
-  return readForPreview(ws, rel || '');
+  return readForPreview(ws || path.dirname(abs), rel || '');
 });
 
 ipcMain.handle('shell:showInFolder', (e, rel) => {
-  const ws = workspaceByWin.get(getWin(e));
-  if (!ws) throw new Error('未打开项目');
-  const abs = safeJoin(ws, rel || '');
+  const ws = workspaceByWin.get(getWin(e)) || '';
+  if (!ws && !isAbsPath(rel)) throw new Error('未打开项目');
+  const extra = extraRoots(APP_ROOT, ws);
+  const abs = resolveRead(ws, extra, rel || '');
   if (!fs.existsSync(abs)) throw new Error('文件不存在');
   shell.showItemInFolder(abs);
   return true;
@@ -404,16 +631,31 @@ ipcMain.handle('ssh:connect', async (e, profile) => {
   return { ok: false, message: result.err || 'SSH 连接失败。第一版请先同步到本地再打开。' };
 });
 
-ipcMain.handle('models:save', (_e, { models, currentModelId }) => {
+ipcMain.handle('models:save', (_e, payload) => {
   const s = store.load();
-  s.models = store.migrateModels(models);
-  s.currentModelId = currentModelId;
+  const models = payload?.models;
+  const providers = payload?.providers;
+  const currentModelId = payload?.currentModelId;
+  if (Array.isArray(providers)) {
+    s.providers = providers.map(store.normalizeProvider).filter(Boolean);
+  }
+  if (Array.isArray(models)) {
+    const migrated = store.migrateProvidersAndModels({
+      providers: s.providers,
+      models
+    });
+    s.providers = migrated.providers;
+    s.models = migrated.models;
+  }
+  if (currentModelId != null) s.currentModelId = currentModelId;
   if (!s.models.some((m) => m.id === s.currentModelId)) {
     s.currentModelId = s.models[0]?.id || 'local-gguf';
   }
   store.save(s);
-  return true;
+  return { models: s.models, providers: s.providers, currentModelId: s.currentModelId };
 });
+
+ipcMain.handle('providers:presets', () => store.PROVIDER_PRESETS);
 
 ipcMain.handle('models:saveAssembly', (_e, { key, slots }) => {
   const s = store.load();
@@ -423,6 +665,13 @@ ipcMain.handle('models:saveAssembly', (_e, { key, slots }) => {
   assembly.syncVisionFields(s, s.assemblies[k].slots);
   store.save(s);
   return { key: k, slots: s.assemblies[k].slots };
+});
+
+ipcMain.handle('models:saveCapabilityDefaults', (_e, payload) => {
+  const s = store.load();
+  s.capabilityDefaults = assembly.normalizeCapabilityDefaults(payload || {});
+  store.save(s);
+  return s.capabilityDefaults;
 });
 
 // 保存视觉代理配置：本地 GGUF 视觉模型 + mmproj 投影文件 + 可选本地 OpenAI 兼容端点
@@ -504,29 +753,97 @@ ipcMain.handle('models:visionStatus', () => {
 });
 
 ipcMain.handle('models:test', async (_e, modelCfg) => {
-  if (modelCfg?.type === 'local' || (!modelCfg?.baseUrl && (modelCfg?.modelPath || /\.gguf$/i.test(modelCfg?.model || '')))) {
-    const s = store.load();
-    const file = localLlm.resolveGgufPath(modelCfg, modelsDirOf(s));
+  const s = store.load();
+  let cfg = modelCfg;
+  if (typeof modelCfg === 'string') cfg = store.resolveModelCfg(modelCfg, s);
+  else if (modelCfg?.id && !modelCfg.baseUrl && modelCfg.type !== 'local' && modelCfg.type !== 'zbaingAi') {
+    cfg = store.resolveModelCfg(modelCfg.id, s) || modelCfg;
+  } else if (modelCfg?.providerId && !modelCfg.baseUrl) {
+    const p = store.findProvider(modelCfg.providerId, s);
+    cfg = {
+      ...modelCfg,
+      type: 'api',
+      baseUrl: p?.baseUrl || '',
+      apiKey: p?.apiKey || '',
+      protocol: p?.protocol || 'openai'
+    };
+  }
+  if (cfg?.type === 'zbaingAi' || cfg?.id === 'zbaingAi') {
+    return zbaingAi.probe(cfg);
+  }
+  if (cfg?.type === 'local' || (!cfg?.baseUrl && (cfg?.modelPath || /\.gguf$/i.test(cfg?.model || '')))) {
+    const file = localLlm.resolveGgufPath(cfg, modelsDirOf(s));
     return localLlm.probe(file);
   }
-  const url = `${String(modelCfg.baseUrl).replace(/\/$/, '')}/models`;
-  const headers = {};
-  if (modelCfg.apiKey) headers.Authorization = `Bearer ${modelCfg.apiKey}`;
-  let res;
-  try {
-    res = await fetch(url, { headers, signal: AbortSignal.timeout(10000) });
-  } catch {
-    throw new Error('连接超时，请检查接口地址和网络是否可达');
+  return apiProtocol.testConnection({
+    ...cfg,
+    protocol: apiProtocol.normalizeProtocol(cfg?.protocol)
+  });
+});
+
+ipcMain.handle('zbaingAi:listModules', async () => {
+  const s = store.load();
+  const modelCfg = store.resolveModelCfg('zbaingAi', s);
+  return zbaingAi.listModules(modelCfg);
+});
+
+ipcMain.handle('zbaingAi:correct', async (_e, payload) => {
+  const s = store.load();
+  const modelCfg = store.resolveModelCfg('zbaingAi', s);
+  return zbaingAi.correct({
+    modelCfg,
+    prompt: payload?.prompt || '',
+    actual: payload?.actual || '',
+    expected: payload?.expected || ''
+  });
+});
+
+ipcMain.handle('zbaingAi:retry', async (_e, payload) => {
+  const s = store.load();
+  const modelCfg = store.resolveModelCfg('zbaingAi', s);
+  return zbaingAi.retry({
+    modelCfg,
+    messages: payload?.messages || [],
+    badReply: payload?.badReply || '',
+    badPrompt: payload?.badPrompt || '',
+    onDelta: () => {}
+  });
+});
+
+function resolveRemoteApiCfg(modelCfg) {
+  const s = store.load();
+  let cfg = modelCfg;
+  if (typeof modelCfg === 'string') {
+    const p = store.findProvider(modelCfg, s);
+    if (p) cfg = { baseUrl: p.baseUrl, apiKey: p.apiKey, protocol: p.protocol };
+    else cfg = store.resolveModelCfg(modelCfg, s);
+  } else if (modelCfg?.providerId && !modelCfg.baseUrl) {
+    const p = store.findProvider(modelCfg.providerId, s);
+    cfg = {
+      baseUrl: p?.baseUrl || modelCfg.baseUrl,
+      apiKey: p?.apiKey || modelCfg.apiKey,
+      protocol: p?.protocol || modelCfg.protocol
+    };
   }
-  if (!res.ok) throw new Error(`测试失败 ${res.status}`);
-  const data = await res.json().catch(() => ({}));
-  const ids = (data.data || []).map((m) => m.id).slice(0, 30);
-  return { ok: true, models: ids };
+  return {
+    ...cfg,
+    protocol: apiProtocol.normalizeProtocol(cfg?.protocol)
+  };
+}
+
+ipcMain.handle('models:listRemote', async (_e, modelCfg) => {
+  return apiProtocol.listModels(resolveRemoteApiCfg(modelCfg));
+});
+
+ipcMain.handle('models:accountBalance', async (_e, modelCfg) => {
+  const cfg = resolveRemoteApiCfg(modelCfg);
+  if (!cfg?.baseUrl) return { available: false };
+  return apiProtocol.fetchAccountBalance(cfg).catch(() => ({ available: false }));
 });
 
 ipcMain.handle('models:listLocal', () => {
   const dir = modelsDirOf(store.load());
-  return { dir, files: localLlm.listGguf(dir) };
+  return { dir, files: listLocalFilesEnriched(dir) };
 });
 
 ipcMain.handle('models:pickDir', async (e) => {
@@ -537,11 +854,11 @@ ipcMain.handle('models:pickDir', async (e) => {
     defaultPath: modelsDirOf(s),
     properties: ['openDirectory', 'createDirectory']
   });
-  if (res.canceled || !res.filePaths[0]) return { dir: modelsDirOf(s), files: localLlm.listGguf(modelsDirOf(s)) };
+  if (res.canceled || !res.filePaths[0]) return { dir: modelsDirOf(s), files: listLocalFilesEnriched(modelsDirOf(s)) };
   s.modelsDir = res.filePaths[0];
   store.save(s);
   const dir = localLlm.ensureDir(s.modelsDir);
-  return { dir, files: localLlm.listGguf(dir) };
+  return { dir, files: listLocalFilesEnriched(dir) };
 });
 
 ipcMain.handle('models:openDir', async () => {
@@ -554,17 +871,24 @@ ipcMain.handle('models:openDir', async () => {
 
 ipcMain.handle('hw:detect', async () => hardware.detect(modelsDirOf(store.load())));
 
-ipcMain.handle('hw:advice', async (_e, purpose) => {
-  const hw = await hardware.detect(modelsDirOf(store.load()));
-  return { hardware: hw, ...hardware.suggest(purpose, hw) };
+ipcMain.handle('hw:advice', async (_e, purpose, opts = {}) => {
+  const hw = opts.hardware || await hardware.detect(modelsDirOf(store.load()));
+  if (opts.forceRefresh) hardware.clearPurposeRepoCache();
+  if (opts.query) {
+    return { hardware: hw, ...(await hardware.suggestQuery(purpose, hw, opts.query, opts)) };
+  }
+  return { hardware: hw, ...(await hardware.suggest(purpose, hw, opts)) };
 });
 
-ipcMain.handle('download:source', async (_e, opts) => downloader.resolveSource(opts || {}));
+ipcMain.handle('download:source', async (_e, opts) => {
+  if (opts?.force) hardware.clearPurposeRepoCache();
+  return downloader.resolveSources(opts || {});
+});
 
-ipcMain.handle('download:search', async (_e, query) => downloader.searchRepos(query));
+ipcMain.handle('download:search', async (_e, query, opts) => downloader.searchRepos(query, 20, opts || {}));
 
-ipcMain.handle('download:repoFiles', async (_e, repo) => {
-  const { source, files } = await downloader.listRepoFiles(repo);
+ipcMain.handle('download:repoFiles', async (_e, repo, opts) => {
+  const { source, files } = await downloader.listRepoFiles(repo, opts || {});
   return {
     source,
     repo,
@@ -573,8 +897,9 @@ ipcMain.handle('download:repoFiles', async (_e, repo) => {
 });
 
 /** 把候选模型解析成真实文件：仓库里的文件名会变，所以下载前才去查 */
-ipcMain.handle('download:resolve', async (_e, { repo, quant }) => {
-  const { source, files } = await downloader.listRepoFiles(repo);
+ipcMain.handle('download:resolve', async (_e, { repo, quant, base }) => {
+  const srcOpts = base ? { base } : {};
+  const { source, files } = await downloader.listRepoFiles(repo, srcOpts);
   const picked = downloader.pickFile(files, quant);
   if (!picked) throw new Error(`仓库 ${repo} 里没有找到可用的 gguf 文件`);
   const url = downloader.fileUrl(source.base, repo, picked.name);
@@ -582,7 +907,7 @@ ipcMain.handle('download:resolve', async (_e, { repo, quant }) => {
   return { source, repo, name: picked.name, size, url };
 });
 
-ipcMain.handle('download:start', async (e, { id, url, name, threads }) => {
+ipcMain.handle('download:start', async (e, { id, url, name, threads, meta }) => {
   const win = getWin(e);
   const dir = modelsDirOf(store.load());
   const result = await downloader.download({
@@ -593,13 +918,27 @@ ipcMain.handle('download:start', async (e, { id, url, name, threads }) => {
     threads: Number(threads) || 4,
     onProgress: (p) => sendTo(win, 'download:progress', p)
   });
-  return { ...result, files: localLlm.listGguf(dir), dir };
+  if (result.ok && result.path && !result.skipped) {
+    try {
+      modelMeta.writeMeta(dir, result.path, meta || {});
+    } catch (err) {
+      diag.log('download', '写入模型元数据失败', { name, message: err && err.message });
+    }
+  } else if (result.ok && result.path && result.skipped && meta && (meta.purpose || meta.repo)) {
+    try {
+      modelMeta.writeMeta(dir, result.path, meta);
+    } catch { /* 已有文件也尽量补写来源 */ }
+  }
+  return { ...result, files: listLocalFilesEnriched(dir), dir };
 });
 
 ipcMain.handle('download:cancel', (_e, id) => downloader.cancel(id));
 
 function listedSkills(ws) {
-  return skillsLib.listDetailed(path.join(APP_ROOT, 'skills'), ws || '', store.load().skillOrder || []);
+  const list = skillsLib.listDetailed(path.join(APP_ROOT, 'skills'), ws || '', store.load().skillOrder || []);
+  const enabled = new Set(store.load().enabledSkills || []);
+  // 给每个技能标注是否被勾选启用（只有勾中的才会注入系统提示）
+  return list.map((s) => ({ ...s, enabled: enabled.has(`${s.scope || 'app'}:${s.id}`) }));
 }
 
 function touchSkillOrder(payload, { remove } = {}) {
@@ -649,6 +988,14 @@ ipcMain.handle('skills:reorder', (e, order) => {
   return listedSkills(ws);
 });
 
+ipcMain.handle('skills:setEnabled', (e, keys) => {
+  const s = store.load();
+  s.enabledSkills = Array.isArray(keys) ? keys.map(String) : [];
+  store.save(s);
+  const ws = workspaceByWin.get(getWin(e)) || '';
+  return listedSkills(ws);
+});
+
 ipcMain.handle('rules:list', (e) => {
   const ws = workspaceByWin.get(getWin(e)) || '';
   return agent.listRules(APP_ROOT, ws);
@@ -673,10 +1020,106 @@ ipcMain.handle('persona:save', (_e, body) => {
   return true;
 });
 
+ipcMain.handle('memory:list', (e) => {
+  const ws = workspaceByWin.get(getWin(e)) || '';
+  if (!ws) return [];
+  return memory.list(ws);
+});
+
+ipcMain.handle('memory:add', (e, payload) => {
+  const ws = workspaceByWin.get(getWin(e)) || '';
+  if (!ws) throw new Error('请先打开项目');
+  memory.addUserMemory(ws, payload || {});
+  return memory.list(ws);
+});
+
+ipcMain.handle('memory:delete', (e, id) => {
+  const ws = workspaceByWin.get(getWin(e)) || '';
+  if (!ws) throw new Error('请先打开项目');
+  memory.remove(ws, id);
+  return memory.list(ws);
+});
+
+ipcMain.handle('memory:clear', (e, payload) => {
+  const ws = workspaceByWin.get(getWin(e)) || '';
+  if (!ws) throw new Error('请先打开项目');
+  const keepPinned = !!(payload && payload.keepPinned);
+  memory.clearAll(ws, { keepPinned });
+  return memory.list(ws);
+});
+
+ipcMain.handle('memory:pin', (e, { id, pinned }) => {
+  const ws = workspaceByWin.get(getWin(e)) || '';
+  if (!ws) throw new Error('请先打开项目');
+  memory.setPinned(ws, id, pinned);
+  return memory.list(ws);
+});
+
+ipcMain.handle('globalMemory:get', () => memoryGlobal.load());
+ipcMain.handle('globalMemory:saveProfile', (_e, profile) => memoryGlobal.saveProfile(profile));
+ipcMain.handle('globalMemory:addPref', async (_e, payload) => {
+  await memoryGlobal.addPref(payload || {});
+  return memoryGlobal.load();
+});
+ipcMain.handle('globalMemory:deletePref', (_e, id) => {
+  memoryGlobal.removePref(id);
+  return memoryGlobal.load();
+});
+ipcMain.handle('globalMemory:pinPref', (_e, { id, pinned }) => {
+  memoryGlobal.setPrefPinned(id, pinned);
+  return memoryGlobal.load();
+});
+
+ipcMain.handle('milestone:list', (e) => {
+  const ws = workspaceByWin.get(getWin(e)) || '';
+  if (!ws) return [];
+  return milestone.list(ws);
+});
+
+ipcMain.handle('milestone:create', (e, payload) => {
+  const ws = workspaceByWin.get(getWin(e)) || '';
+  if (!ws) throw new Error('请先打开项目');
+  const entry = milestone.create(ws, payload || {});
+  return { entry, list: milestone.list(ws) };
+});
+
+ipcMain.handle('milestone:rename', (e, { id, name }) => {
+  const ws = workspaceByWin.get(getWin(e)) || '';
+  if (!ws) throw new Error('请先打开项目');
+  milestone.rename(ws, id, name);
+  return milestone.list(ws);
+});
+
+ipcMain.handle('milestone:delete', (e, id) => {
+  const ws = workspaceByWin.get(getWin(e)) || '';
+  if (!ws) throw new Error('请先打开项目');
+  milestone.remove(ws, id);
+  return milestone.list(ws);
+});
+
+ipcMain.handle('milestone:match', (e, paths) => {
+  const ws = workspaceByWin.get(getWin(e)) || '';
+  if (!ws) return [];
+  return milestone.matchChanges(ws, paths || []);
+});
+
 ipcMain.handle('snapshot:list', (e) => {
   const ws = workspaceByWin.get(getWin(e));
   if (!ws) return [];
   return snapshot.list(ws);
+});
+
+ipcMain.handle('snapshot:getMax', (e) => {
+  const ws = workspaceByWin.get(getWin(e));
+  if (!ws) return snapshot.DEFAULT_MAX_SNAPSHOTS;
+  return snapshot.getMax(ws);
+});
+
+ipcMain.handle('snapshot:setMax', (e, max) => {
+  const ws = workspaceByWin.get(getWin(e));
+  if (!ws) throw new Error('请先打开项目');
+  const limit = snapshot.setMax(ws, max);
+  return { max: limit, list: snapshot.list(ws) };
 });
 
 ipcMain.handle('snapshot:restore', (e, id) => {
@@ -695,6 +1138,35 @@ ipcMain.handle('snapshot:redo', (e, id) => {
   const ws = workspaceByWin.get(getWin(e));
   if (!ws) throw new Error('未选择工作目录');
   return snapshot.redo(ws, id);
+});
+
+ipcMain.handle('snapshot:hunks', (e, payload) => {
+  const ws = workspaceByWin.get(getWin(e));
+  if (!ws) throw new Error('未选择工作目录');
+  const body = payload || {};
+  return snapshot.listFileHunks(ws, body.id, body.path);
+});
+
+ipcMain.handle('snapshot:rejectHunk', (e, payload) => {
+  const ws = workspaceByWin.get(getWin(e));
+  if (!ws) throw new Error('未选择工作目录');
+  const body = payload || {};
+  const result = snapshot.rejectFileHunk(ws, body.id, body.path, body.index);
+  try {
+    const abs = path.resolve(ws, String(body.path || ''));
+    codeIndex.upsertFile(ws, abs, []);
+  } catch { /* 拒绝后地图更新失败不影响文件已写回 */ }
+  return result;
+});
+
+ipcMain.handle('dialog:folder', async (e) => {
+  const win = getWin(e);
+  const res = await dialog.showOpenDialog(win, {
+    title: '添加文件夹',
+    properties: ['openDirectory']
+  });
+  if (res.canceled || !res.filePaths[0]) return null;
+  return res.filePaths[0];
 });
 
 ipcMain.handle('dialog:files', async (e) => {
@@ -781,6 +1253,92 @@ function collectClipboardAttachments() {
   return { kind: 'none', files: [] };
 }
 
+/* ===== 剪贴板实时监听（左栏常驻面板数据源） =====
+ * Electron 没有原生剪贴板变化事件，标准做法是主进程轮询：
+ * 指纹变化才构建条目并广播给所有窗口；历史只存内存，重启清零。 */
+const CLIPBOARD_POLL_MS = 800;    // 轮询间隔（毫秒）
+const CLIPBOARD_HISTORY_MAX = 10; // 面板保留的历史条数
+let clipboardHistory = [];
+let lastClipboardFingerprint = '';
+
+function clipboardFingerprint() {
+  // 复制文件时系统会同时携带文本与位图，必须先识别文件路径
+  const paths = readClipboardFilePaths();
+  if (paths.length) return 'files:' + paths.join('|');
+  const img = clipboard.readImage();
+  if (!img.isEmpty()) {
+    const size = img.getSize();
+    // 宽高 + PNG 字节长度当指纹：内容变了但尺寸没变也能识别
+    return 'image:' + size.width + 'x' + size.height + ':' + img.toPNG().length;
+  }
+  const text = clipboard.readText() || '';
+  if (text) return 'text:' + text;
+  return '';
+}
+
+function buildClipboardEntry() {
+  const paths = readClipboardFilePaths();
+  if (paths.length) {
+    const label = paths.length === 1
+      ? path.basename(paths[0])
+      : path.basename(paths[0]) + ' 等 ' + paths.length + ' 项';
+    return { kind: 'files', paths, name: label };
+  }
+  const img = clipboard.readImage();
+  if (!img.isEmpty()) {
+    const file = writePasteBuffer('clipboard.png', img.toPNG());
+    return { kind: 'image', path: file.path, name: file.name };
+  }
+  const text = clipboard.readText() || '';
+  if (text) return { kind: 'text', text };
+  return null;
+}
+
+function pushClipboardEntry(entry) {
+  const top = clipboardHistory[0];
+  if (top && top.kind === entry.kind) {
+    const dup = entry.kind === 'text' ? top.text === entry.text
+      : entry.kind === 'image' ? top.path === entry.path
+        : (top.paths || []).join('|') === (entry.paths || []).join('|');
+    if (dup) return false;
+  }
+  clipboardHistory.unshift({
+    id: 'cb_' + Date.now() + '_' + Math.random().toString(16).slice(2, 8),
+    at: Date.now(),
+    ...entry
+  });
+  clipboardHistory = clipboardHistory.slice(0, CLIPBOARD_HISTORY_MAX);
+  return true;
+}
+
+function broadcastClipboard() {
+  for (const win of windows) sendTo(win, 'clipboard:update', { history: clipboardHistory });
+}
+
+function startClipboardWatch() {
+  const timer = setInterval(() => {
+    try {
+      const fp = clipboardFingerprint();
+      if (fp === lastClipboardFingerprint) return;
+      lastClipboardFingerprint = fp;
+      if (!fp) return; // 剪贴板被清空：保留历史，只是不再新增
+      const entry = buildClipboardEntry();
+      if (entry && pushClipboardEntry(entry)) broadcastClipboard();
+    } catch (e) {
+      diag.log('clipboard', '剪贴板监听异常', { message: e && e.message });
+    }
+  }, CLIPBOARD_POLL_MS);
+  timer.unref?.();
+}
+
+ipcMain.handle('clipboard:get', () => ({ history: clipboardHistory }));
+
+ipcMain.handle('clipboard:clear', () => {
+  clipboardHistory = [];
+  broadcastClipboard();
+  return true;
+});
+
 ipcMain.on('clipboard:paste-sync', (e) => {
   try {
     e.returnValue = collectClipboardAttachments();
@@ -818,7 +1376,9 @@ ipcMain.handle('sessions:list', () => {
         title: data.title,
         workspace: data.workspace,
         updatedAt: data.updatedAt,
-        messageCount: Array.isArray(data.messages) ? data.messages.length : 0
+        messageCount: Array.isArray(data.messages) ? data.messages.length : 0,
+
+        hasComposer: !!(data.composer && (data.composer.text || (data.composer.attachments && data.composer.attachments.length) || data.composer.refillFromIndex != null))
       });
     } catch {
       /* 忽略损坏会话 */
@@ -860,24 +1420,95 @@ ipcMain.handle('sessions:rename', (_e, { id, title }) => {
   return { id: data.id, title: data.title };
 });
 
-ipcMain.handle('chat:abort', (e) => {
-  const c = abortByWin.get(getWin(e));
-  if (c) c.abort();
+ipcMain.handle('chat:abort', (e, turnId) => {
+  const win = getWin(e);
+  const id = String(turnId || '');
+  const asks = pendingAskMap(win);
+  const aborts = abortMap(win);
+  if (id) {
+    const pending = asks.get(id);
+    if (pending) {
+      pending.reject(Object.assign(new Error('已停止'), { name: 'AbortError' }));
+      asks.delete(id);
+    }
+    const c = aborts.get(id);
+    if (c) c.abort();
+    return;
+  }
+  for (const pending of asks.values()) {
+    pending.reject(Object.assign(new Error('已停止'), { name: 'AbortError' }));
+  }
+  asks.clear();
+  for (const c of aborts.values()) c.abort();
+});
+
+ipcMain.handle('chat:answer', (e, payload) => {
+  const win = getWin(e);
+  const asks = pendingAskMap(win);
+  const answer = payload && typeof payload === 'object' && !Array.isArray(payload)
+    ? payload.answer
+    : payload;
+  const id = String((payload && payload.turnId) || '');
+  const pending = (id && asks.get(id)) || [...asks.values()].at(-1);
+  if (!pending) return false;
+  for (const [k, v] of asks) {
+    if (v === pending) asks.delete(k);
+  }
+  pending.resolve(String(answer ?? ''));
+  return true;
 });
 
 ipcMain.handle('chat:send', async (e, payload) => {
   const win = getWin(e);
-  const ws = workspaceByWin.get(win);
+  const ws = String(payload?.workspace || workspaceByWin.get(win) || '');
   const s = store.load();
-  const modelCfg = (s.models || []).find((m) => m.id === (payload.modelId || s.currentModelId));
+  const modelCfg = store.resolveModelCfg(payload.modelId || s.currentModelId, s);
   const ctl = new AbortController();
-  abortByWin.set(win, ctl);
+  const turnId = String(payload?.turnId || '');
+  if (turnId) abortMap(win).set(turnId, ctl);
   const order = store.load().skillOrder || [];
   const skills = agent.listSkills(APP_ROOT, ws, order);
   const allSkills = skillsLib.listDetailed(path.join(APP_ROOT, 'skills'), ws, order);
-  const skill = payload.skillId ? skills.find((x) => x.id === payload.skillId) : null;
+  const onEvent = (ev) => sendTo(win, 'chat:event', turnId ? { ...ev, turnId } : ev);
+  // 技能选择优先级：本条消息显式指定的技能 > 侧栏勾选启用的技能集合 > 优先度最高的那个（列表最上面的）。
+  // skills 已按 skillOrder 排过序并滤掉被同名覆盖的。
+  const enabledKeys = new Set(store.load().enabledSkills || []);
+  const payloadIds = [];
+  for (const id of [].concat(payload.skillIds || (payload.skillId ? [payload.skillId] : []))) {
+    const s = String(id || '').trim();
+    if (s && !payloadIds.includes(s)) payloadIds.push(s);
+  }
+  const payloadSkills = payloadIds.map((id) => skills.find((x) => x.id === id)).filter(Boolean);
+  let chosen = payloadSkills.length
+    ? payloadSkills
+    : skills.filter((x) => enabledKeys.has(`${x.scope || 'app'}:${x.id}`));
+  if (!chosen.length) chosen = skills[0] ? [skills[0]] : [];
+  // 多个技能合并成一个注入对象：名称用 + 连接，正文按顺序拼接
+  const skill = chosen.length
+    ? {
+      id: chosen.map((x) => x.id).join('+'),
+      name: chosen.map((x) => x.name).join(' + '),
+      body: chosen.map((x) => x.body).join('\n\n---\n\n')
+    }
+    : null;
+  if (!skill) {
+    const msg = '没有可用技能。请在「管理技能」里新建一个。';
+    onEvent({ type: 'error', message: msg });
+    throw new Error(msg);
+  }
   const rules = agent.listRules(APP_ROOT, ws);
-  const onEvent = (ev) => sendTo(win, 'chat:event', ev);
+  const waitForUserAnswer = (ask, signal) => new Promise((resolve, reject) => {
+    const onAbort = () => {
+      pendingAskMap(win).delete(turnId);
+      reject(Object.assign(new Error('已停止'), { name: 'AbortError' }));
+    };
+    if (signal?.aborted) {
+      onAbort();
+      return;
+    }
+    pendingAskMap(win).set(turnId, { resolve, reject, ask });
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
+  });
   try {
     const result = await agent.runTurn({
       workspace: ws,
@@ -891,7 +1522,13 @@ ipcMain.handle('chat:send', async (e, payload) => {
       rules,
       allSkills,
       onEvent,
-      signal: ctl.signal
+      signal: ctl.signal,
+      workingMemory: payload.workingMemory,
+      contextSummary: payload.contextSummary,
+      extraFolders: payload.extraFolders || [],
+      waitForUserAnswer,
+      maxAgentRounds: payload.maxAgentRounds,
+      unlimitedRounds: !!payload.unlimitedRounds
     });
     return result;
   } catch (err) {
@@ -902,6 +1539,7 @@ ipcMain.handle('chat:send', async (e, payload) => {
     onEvent({ type: 'error', message: msg });
     throw err;
   } finally {
-    abortByWin.delete(win);
+    pendingAskMap(win).delete(turnId);
+    abortMap(win).delete(turnId);
   }
 });

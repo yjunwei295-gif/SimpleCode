@@ -9,16 +9,29 @@ const MIRRORS = ['https://hf-mirror.com'];
 
 const PROBE_TIMEOUT_MS = 6000;
 const PROGRESS_INTERVAL_MS = 400;
-// 连接卡住不动超过这个时间就重来，避免一直吊着
-const IDLE_TIMEOUT_MS = 45000;
-const MAX_ATTEMPTS = 8;
+// 等响应头可以久一点：大文件走镜像时，重定到 CDN 经常要一两分钟才出第一个字节
+const HEADER_TIMEOUT_MS = 180000;
+// 已经在收数据之后，超过这个时间没有新字节才算卡住
+const IDLE_TIMEOUT_MS = 120000;
+const MAX_ATTEMPTS = 20;
+
+// 按文件大小决定并发分片数：调用方明确给了并发数就照办（夹在 1~8）；传 'auto' 或没给有效数字时按大小分档
+function threadsForSize(total, requested) {
+  const want = Number(requested);
+  if (Number.isFinite(want) && want > 0) {
+    return Math.max(1, Math.min(8, want));
+  }
+  if (total >= 1024 * 1024 * 1024) return 8;
+  if (total >= 64 * 1024 * 1024) return 4;
+  return 2;
+}
 
 /** 401/403 是源站拒绝，再重试也不会变成 200 */
 function isAuthReject(err) {
   return /\b40[13]\b/.test(String(err && err.message || err || ''));
 }
 
-let cachedSource = null;
+let cachedSources = null;
 let probing = null;
 
 // 进行中的下载任务：id -> { controller, dest, part }
@@ -43,30 +56,33 @@ async function reachable(base) {
   }
 }
 
-/**
- * 确定当前可用的下载源：官方通就用官方，不通再依次试镜像
- * @param {{force?: boolean}} [opts] force 为真时忽略缓存重新探测
- */
-async function resolveSource(opts = {}) {
-  if (cachedSource && !opts.force) return cachedSource;
+/** 列出所有可用的下载源（官方 + 镜像，能连上的都返回） */
+async function resolveSources(opts = {}) {
+  if (cachedSources && !opts.force) return cachedSources;
   if (probing && !opts.force) return probing;
   probing = (async () => {
+    const sources = [];
     if (await reachable(OFFICIAL)) {
-      cachedSource = { base: OFFICIAL, name: '官方 HuggingFace', official: true };
-    } else {
-      cachedSource = null;
-      for (const m of MIRRORS) {
-        if (await reachable(m)) {
-          cachedSource = { base: m, name: `镜像 ${new URL(m).host}`, official: false };
-          break;
-        }
-      }
-      if (!cachedSource) {
-        cachedSource = { base: OFFICIAL, name: '官方 HuggingFace（探测失败）', official: true, unreachable: true };
+      sources.push({ id: 'official', base: OFFICIAL, name: '官方 HuggingFace', official: true });
+    }
+    for (const m of MIRRORS) {
+      if (await reachable(m)) {
+        const host = new URL(m).host;
+        sources.push({ id: host, base: m, name: `镜像 ${host}`, official: false });
       }
     }
-    diag.log('download', '下载源探测完成', cachedSource);
-    return cachedSource;
+    if (!sources.length) {
+      sources.push({
+        id: 'official-fallback',
+        base: OFFICIAL,
+        name: '官方 HuggingFace（探测失败）',
+        official: true,
+        unreachable: true
+      });
+    }
+    cachedSources = { sources, primary: sources.find((s) => !s.unreachable) || sources[0] };
+    diag.log('download', '下载源探测完成', cachedSources);
+    return cachedSources;
   })();
   try {
     return await probing;
@@ -75,11 +91,26 @@ async function resolveSource(opts = {}) {
   }
 }
 
+/**
+ * 确定当前可用的下载源（兼容旧接口，返回 primary）
+ * @param {{force?: boolean}} [opts] force 为真时忽略缓存重新探测
+ */
+async function resolveSource(opts = {}) {
+  const { primary } = await resolveSources(opts);
+  return primary;
+}
+
+async function sourceFromOpts(opts = {}) {
+  const base = String(opts.base || '').trim();
+  if (base) return { base, name: base };
+  return resolveSource(opts);
+}
+
 async function getJson(url) {
   const t = withTimeout(15000);
   try {
     const res = await net.fetch(url, { signal: t.signal });
-    if (!res.ok) throw new Error(`请求失败 ${res.status}`);
+    if (!res.ok) throw new Error(`读取 ${url} 失败 ${res.status}`);
     return await res.json();
   } finally {
     t.done();
@@ -90,11 +121,14 @@ async function getJson(url) {
  * 搜索 HuggingFace 上的 GGUF 仓库
  * @param {string} query 关键词
  */
-async function searchRepos(query) {
-  const src = await resolveSource();
+async function searchRepos(query, limit = 20, opts = {}) {
+  const src = await sourceFromOpts(opts);
   const q = encodeURIComponent(String(query || '').trim());
   if (!q) return { source: src, repos: [] };
-  const url = `${src.base}/api/models?search=${q}&filter=gguf&limit=20&sort=downloads&direction=-1`;
+  const n = Math.max(1, Math.min(50, Number(limit) || 20));
+  const ggufFilter = opts.ggufFilter !== false;
+  let url = `${src.base}/api/models?search=${q}&limit=${n}&sort=downloads&direction=-1`;
+  if (ggufFilter) url += '&filter=gguf';
   const list = await getJson(url);
   const repos = (Array.isArray(list) ? list : []).map((m) => ({
     repo: m.id || m.modelId || '',
@@ -112,27 +146,39 @@ function isSplitPart(name) {
  * 列出仓库里的 gguf 文件（含体积）。分卷文件会被排除，本地引擎加载不了
  * @param {string} repo 形如 bartowski/Qwen2.5-Coder-7B-Instruct-GGUF
  */
-async function listRepoFiles(repo) {
-  const src = await resolveSource();
-  const info = await getJson(`${src.base}/api/models/${repo}?blobs=true`);
-  const files = (info.siblings || [])
-    .map((s) => ({ name: s.rfilename, size: s.size || s.lfs?.size || 0 }))
-    .filter((f) => {
-      const n = f.name.toLowerCase();
-      if (/\.mmproj$/i.test(n)) return true;
-      if (/\.gguf$/i.test(n) && !isSplitPart(f.name)) return true;
-      return false;
-    })
-    .sort((a, b) => a.size - b.size);
-  return { source: src, repo, files };
+async function listRepoFiles(repo, opts = {}) {
+  const preferred = opts.base ? String(opts.base).trim() : '';
+  const bases = preferred
+    ? candidateBases(preferred)
+    : candidateBases((await resolveSource()).base);
+  let lastErr = null;
+  for (const base of bases) {
+    try {
+      const info = await getJson(`${base}/api/models/${repo}?blobs=true`);
+      const files = (info.siblings || [])
+        .map((s) => ({ name: s.rfilename, size: s.size || s.lfs?.size || 0 }))
+        .filter((f) => {
+          const n = f.name.toLowerCase();
+          if (/\.mmproj$/i.test(n)) return true;
+          if (/\.gguf$/i.test(n) && !isSplitPart(f.name)) return true;
+          return false;
+        })
+        .sort((a, b) => a.size - b.size);
+      return { source: { base, name: base }, repo, files };
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr || new Error(`无法读取仓库 ${repo}`);
 }
 
-/** 按量化等级从仓库文件里挑一个，挑不到就退回体积最接近的 */
+/** 按量化等级从仓库文件里挑主模型 gguf，跳过 mmproj 投影文件 */
 function pickFile(files, quant) {
+  const list = (files || []).filter((f) => !/mmproj/i.test(String(f.name || '')));
   const want = String(quant || 'Q4_K_M').toLowerCase();
-  return files.find((f) => f.name.toLowerCase().includes(want))
-    || files.find((f) => f.name.toLowerCase().includes('q4'))
-    || files[0]
+  return list.find((f) => f.name.toLowerCase().includes(want))
+    || list.find((f) => f.name.toLowerCase().includes('q4'))
+    || list[0]
     || null;
 }
 
@@ -174,19 +220,25 @@ function safeName(name) {
 async function attemptOnce({ url, part, userSignal, onChunk }) {
   let downloaded = fs.existsSync(part) ? fs.statSync(part).size : 0;
 
-  // 除了用户取消，卡住不动超过 IDLE_TIMEOUT_MS 也要中断，交给外层重试
+  // 用户取消，或长时间没有新数据，都中断这次尝试。首次等响应头单独放宽
   const attemptCtrl = new AbortController();
   const abortByUser = () => attemptCtrl.abort();
   userSignal.addEventListener('abort', abortByUser);
   let idleTimer = null;
-  const kickIdle = () => {
+  let stalled = false;
+  let stallSec = 0;
+  const arm = (ms) => {
     clearTimeout(idleTimer);
-    idleTimer = setTimeout(() => attemptCtrl.abort(), IDLE_TIMEOUT_MS);
+    idleTimer = setTimeout(() => {
+      stalled = true;
+      stallSec = Math.round(ms / 1000);
+      attemptCtrl.abort();
+    }, ms);
   };
 
   let stream = null;
   try {
-    kickIdle();
+    arm(HEADER_TIMEOUT_MS);
     const headers = { 'User-Agent': 'SimpleCode' };
     if (downloaded > 0) headers.Range = `bytes=${downloaded}-`;
     const res = await net.fetch(url, { headers, signal: attemptCtrl.signal });
@@ -206,12 +258,13 @@ async function attemptOnce({ url, part, userSignal, onChunk }) {
     const remain = Number(res.headers.get('content-length') || 0);
     const total = resumed ? downloaded + remain : remain;
 
+    arm(IDLE_TIMEOUT_MS);
     stream = fs.createWriteStream(part, { flags: resumed ? 'a' : 'w' });
     const reader = res.body.getReader();
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
-      kickIdle();
+      arm(IDLE_TIMEOUT_MS);
       downloaded += value.length;
       if (!stream.write(Buffer.from(value))) {
         await new Promise((resolve) => stream.once('drain', resolve));
@@ -223,6 +276,14 @@ async function attemptOnce({ url, part, userSignal, onChunk }) {
     });
     stream = null;
     return { completed: true, total, downloaded };
+  } catch (err) {
+    if (stalled && !userSignal.aborted) {
+      throw new Error(`超过 ${stallSec} 秒没有收到新数据`);
+    }
+    if (!userSignal.aborted && /aborted/i.test(String(err && err.message || ''))) {
+      throw new Error('下载连接被中断');
+    }
+    throw err;
   } finally {
     clearTimeout(idleTimer);
     userSignal.removeEventListener('abort', abortByUser);
@@ -262,12 +323,18 @@ async function downloadSlice({ url, fd, start, end, got, userSignal, onBytes }) 
   const abortByUser = () => attemptCtrl.abort();
   userSignal.addEventListener('abort', abortByUser);
   let idleTimer = null;
-  const kickIdle = () => {
+  let stalled = false;
+  let stallSec = 0;
+  const arm = (ms) => {
     clearTimeout(idleTimer);
-    idleTimer = setTimeout(() => attemptCtrl.abort(), IDLE_TIMEOUT_MS);
+    idleTimer = setTimeout(() => {
+      stalled = true;
+      stallSec = Math.round(ms / 1000);
+      attemptCtrl.abort();
+    }, ms);
   };
   try {
-    kickIdle();
+    arm(HEADER_TIMEOUT_MS);
     const res = await net.fetch(url, {
       headers: { Range: `bytes=${pos}-${end}`, 'User-Agent': 'SimpleCode' },
       signal: attemptCtrl.signal
@@ -278,17 +345,26 @@ async function downloadSlice({ url, fd, start, end, got, userSignal, onBytes }) 
       }
       throw new Error(`分片返回 ${res.status}，无法续传`);
     }
+    arm(IDLE_TIMEOUT_MS);
     const reader = res.body.getReader();
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
-      kickIdle();
+      arm(IDLE_TIMEOUT_MS);
       const buf = Buffer.from(value);
       fs.writeSync(fd, buf, 0, buf.length, pos);
       pos += buf.length;
       onBytes(buf.length);
     }
     if (pos !== end + 1) throw new Error(`分片不完整：写到 ${pos}，期望 ${end + 1}`);
+  } catch (err) {
+    if (stalled && !userSignal.aborted) {
+      throw new Error(`超过 ${stallSec} 秒没有收到新数据`);
+    }
+    if (!userSignal.aborted && /aborted/i.test(String(err && err.message || ''))) {
+      throw new Error('下载连接被中断');
+    }
+    throw err;
   } finally {
     clearTimeout(idleTimer);
     userSignal.removeEventListener('abort', abortByUser);
@@ -393,14 +469,14 @@ async function download({ id, url, dir, name, onProgress, threads = 4 }) {
   }
   fs.mkdirSync(dir, { recursive: true });
 
-  const nThreads = Math.max(1, Math.min(8, Number(threads) || 4));
   const controller = new AbortController();
   tasks.set(id, { controller, dest, part });
-  diag.log('download', '开始下载', { id, url, dest, threads: nThreads, 已有字节: fs.existsSync(part) ? fs.statSync(part).size : 0 });
+  diag.log('download', '开始下载', { id, url, dest, threads: threads ?? 'auto', 已有字节: fs.existsSync(part) ? fs.statSync(part).size : 0 });
   const startedAt = Date.now();
 
   try {
     let total = await remoteSize(url);
+    const nThreads = threadsForSize(total, threads);
     const canRange = nThreads > 1 && total > 8 * 1024 * 1024 && await rangeSupported(url);
     if (canRange) {
       try {
@@ -491,6 +567,6 @@ function candidateBases(preferred) {
 }
 
 module.exports = {
-  resolveSource, searchRepos, listRepoFiles, pickFile, fileUrl, remoteSize,
+  resolveSource, resolveSources, searchRepos, listRepoFiles, pickFile, fileUrl, remoteSize,
   download, cancel, cancelAll, candidateBases, isAuthReject
 };

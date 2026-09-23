@@ -4,7 +4,6 @@ const os = require('os');
 const crypto = require('crypto');
 const { spawnSync } = require('child_process');
 
-const MAX_TEXT = 80000;
 const MAX_IMAGES = 12;
 const MAX_EACH = 2.5 * 1024 * 1024;
 const MIN_EACH = 800;
@@ -37,7 +36,7 @@ function isDocumentExt(ext) {
 }
 
 function clipText(s) {
-  return String(s || '').slice(0, MAX_TEXT);
+  return String(s || '');
 }
 
 function decodeXml(s) {
@@ -341,7 +340,6 @@ function extractOleText(buf) {
     if (seen.has(t)) continue;
     seen.add(t);
     uniq.push(t);
-    if (uniq.join('\n').length > MAX_TEXT) break;
   }
   return uniq.join('\n');
 }
@@ -479,7 +477,7 @@ async function parseAttachment(abs) {
     if (text.includes('\u0000')) {
       return { kind: 'file', name, text: `二进制文件：${name}，大小 ${fs.statSync(abs).size} 字节。` };
     }
-    return { kind: 'text', name, text: text.slice(0, 200000) };
+    return { kind: 'text', name, text };
   } catch {
     return { kind: 'file', name, text: `无法按文本读取：${name}` };
   }

@@ -158,12 +158,26 @@ function openModalVs(html) {
   $vs('modal-card').classList.remove('wide');
   $vs('modal-card').onclick = null;
   $vs('modal-card').innerHTML = html;
-  $vs('modal').classList.remove('hidden');
+  const modal = $vs('modal');
+  modal.classList.remove('hidden');
+  modal.classList.remove('is-open');
+  void modal.offsetWidth;
+  requestAnimationFrame(() => modal.classList.add('is-open'));
 }
 
 function closeModalVs() {
-  $vs('modal').classList.add('hidden');
-  $vs('modal-card').classList.remove('vs-card');
+  const modal = $vs('modal');
+  modal.classList.remove('is-open');
+  const hide = () => {
+    modal.classList.add('hidden');
+    $vs('modal-card').classList.remove('vs-card');
+  };
+  try {
+    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) hide();
+    else setTimeout(hide, 200);
+  } catch {
+    hide();
+  }
 }
 
 const ROLES = [
@@ -184,6 +198,7 @@ let visionState = {
   slots: [],
   localFiles: [],
   modelsDir: '',
+  zbaingModules: [],
   started: false,
   startError: ''
 };
@@ -225,15 +240,20 @@ async function openVisionSettings() {
   const s = await api.getState();
   const local = await api.listLocalModels().catch(() => ({ files: [], dir: '' }));
   const status = await api.visionAgentStatus().catch(() => ({ started: false, error: '' }));
+  const zbMods = api.listZbaingModules
+    ? await api.listZbaingModules().catch(() => [])
+    : [];
   const key = (s && s.assemblyKey) || '';
   const pack = ((s && s.assemblies) || {})[key] || { slots: [] };
   visionState = {
     models: (s && s.models) || [],
+    providers: (s && s.providers) || [],
     currentModelId: (s && s.currentModelId) || '',
     assemblyKey: key,
     slots: Array.isArray(pack.slots) ? pack.slots.map((x) => ({ ...x })) : [],
     localFiles: (local && local.files) || [],
     modelsDir: (local && local.dir) || (s && s.modelsDir) || '',
+    zbaingModules: Array.isArray(zbMods) ? zbMods : [],
     started: !!(status && status.started),
     startError: (status && status.error) || ''
   };
@@ -258,13 +278,23 @@ async function saveAssembly() {
 }
 
 function modelOptions(slot) {
-  const local = visionState.localFiles.map((f) =>
-    `<option value="local:${escapeHtmlVs(f.name)}" ${slot.type !== 'api' && slot.model === f.name ? 'selected' : ''}>${t('local')} · ${escapeHtmlVs(f.name)}</option>`
-  ).join('');
+  const local = visionState.localFiles.map((f) => {
+    const tag = f.purposeLabel || f.meta?.purpose || '';
+    const tagText = tag ? ` · ${tag}` : '';
+    return `<option value="local:${escapeHtmlVs(f.name)}" ${slot.type !== 'api' && slot.type !== 'zbaingModule' && slot.model === f.name ? 'selected' : ''}>${t('local')} · ${escapeHtmlVs(f.name)}${escapeHtmlVs(tagText)}</option>`;
+  }).join('');
+  const zmods = (visionState.zbaingModules || [])
+    .filter((m) => m.kind === 'zlm' && m.id)
+    .map((m) => {
+      const tag = m.trained ? '✓' : '○';
+      const sel = slot.type === 'zbaingModule' && slot.moduleId === m.id ? 'selected' : '';
+      const label = `${tag} zbaing · ${m.name || m.id} · ${m.params || ''}`;
+      return `<option value="zbaing:${escapeHtmlVs(m.id)}" ${sel}>${escapeHtmlVs(label)}</option>`;
+    }).join('');
   const apis = visionState.models.filter((m) => m.type !== 'local').map((m) =>
     `<option value="api:${escapeHtmlVs(m.id)}" ${slot.apiId === m.id ? 'selected' : ''}>${t('api')} · ${escapeHtmlVs(m.name)} · ${escapeHtmlVs(m.model || '')}</option>`
   ).join('');
-  return `<option value="">${t('unset')}</option>${local}${apis}`;
+  return `<option value="">${t('unset')}</option>${zmods}${local}${apis}`;
 }
 
 function renderSlots() {
@@ -306,7 +336,7 @@ function renderVisionModal() {
         </label>
         <div class="vs-model-info">
           <div class="vs-model-name">${escapeHtmlVs(m.name)}</div>
-          <div class="vs-model-sub">${escapeHtmlVs(m.model || m.baseUrl || '')}</div>
+          <div class="vs-model-sub">${escapeHtmlVs(m.model || m.providerId || '')}</div>
         </div>
         <span class="vs-badge ${m.vision ? 'on' : ''}">${m.vision ? t('supportsVision') : t('noVision')}</span>
       </div>`)
@@ -379,33 +409,23 @@ function renderVisionModal() {
     renderVisionModal();
   };
   $vs('vs-done').onclick = async () => {
-    await saveAssembly();
-    const vision = visionState.slots.find((s) => s.role === 'vision' && s.model && s.type !== 'api');
     const statusEl = $vs('vs-start-status');
-    if (!vision) {
-      closeModalVs();
+    try {
+      await saveAssembly();
+      await api.saveModels(visionState.models, visionState.currentModelId, visionState.providers);
+    } catch (err) {
+      alert(err && err.message ? err.message : t('saveFail'));
       return;
     }
-    if (statusEl) {
-      paintVisionStatus({ text: t('startingVision') });
-    }
+    const vision = visionState.slots.find((s) => s.role === 'vision' && s.model && s.type !== 'api');
+    // 先关窗：配置已保存；看图引擎在后台按需启动，不挡住「完成」
+    closeModalVs();
+    if (!vision) return;
     try {
-      const res = await api.startVisionAgent();
-      visionState.started = true;
-      visionState.startError = '';
-      if (res && res.mmproj) {
-        const slot = visionState.slots.find((s) => s.role === 'vision' && s.model && s.type !== 'api');
-        if (slot) slot.mmproj = res.mmproj;
-        const input = document.querySelector('[data-slot-mmproj]');
-        if (input) input.value = res.mmproj;
-      }
-      paintVisionStatus({ text: t('visionStarted'), ok: true, pct: 100, keepBar: true });
-      setTimeout(closeModalVs, 600);
-    } catch (err) {
-      visionState.started = false;
-      const raw = String(err && err.message || err || t('startFail'));
-      visionState.startError = raw.replace(/^Error invoking remote method '[^']+': (Error:\s*)?/, '');
-      paintVisionStatus({ text: t('startFailLine', { msg: visionState.startError }), error: true });
+      if (statusEl) { /* modal already closing */ }
+      await api.startVisionAgent();
+    } catch {
+      /* 发图时还会再启动；此处不弹窗打断 */
     }
   };
 
@@ -424,7 +444,7 @@ function renderVisionModal() {
     if (!m) return;
     m.vision = cb.checked;
     try {
-      await api.saveModels(visionState.models, visionState.currentModelId);
+      await api.saveModels(visionState.models, visionState.currentModelId, visionState.providers);
       renderVisionModal();
     } catch (err) {
       alert(err && err.message ? err.message : t('saveFail'));
@@ -447,21 +467,31 @@ function renderVisionModal() {
       if (v.startsWith('api:')) {
         slot.type = 'api';
         slot.apiId = v.slice(4);
+        slot.moduleId = '';
         const m = visionState.models.find((x) => x.id === slot.apiId);
         slot.model = m?.model || '';
         slot.name = m?.name || '';
       } else if (v.startsWith('local:')) {
         slot.type = 'local';
         slot.apiId = '';
+        slot.moduleId = '';
         slot.model = v.slice(6);
         if (slot.role === 'vision') {
           const leaf = String(slot.mmproj || '').split(/[\\/]/).pop();
           const looksWrong = !leaf || (/\.gguf$/i.test(leaf) && !/mmproj/i.test(leaf));
           if (looksWrong) slot.mmproj = (await guessMmprojFor(slot.model)) || '';
         }
+      } else if (v.startsWith('zbaing:')) {
+        slot.type = 'zbaingModule';
+        slot.moduleId = v.slice(7);
+        slot.apiId = '';
+        slot.model = '';
+        const zm = (visionState.zbaingModules || []).find((x) => x.id === slot.moduleId);
+        slot.name = zm?.name || slot.moduleId;
       } else {
         slot.model = '';
         slot.apiId = '';
+        slot.moduleId = '';
       }
     }
     if (mmEl) {

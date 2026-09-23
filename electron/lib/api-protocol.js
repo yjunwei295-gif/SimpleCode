@@ -656,30 +656,49 @@ async function readSseStream(res, { onEvent, signal, onFirst, onChunk }) {
 
 async function completeOpenAI({ modelCfg, messages, stream, tools, onDelta, onReason, signal, onWait, ctl }) {
   const url = `${openaiRoot(modelCfg.baseUrl)}/chat/completions`;
-  const makeBody = (withUsage) => {
+  const makeBody = (withUsage, parallelTools) => {
     const body = {
       model: modelCfg.model,
       messages,
       stream: !!stream
     };
-    if (tools?.length) body.tools = tools;
+    if (tools?.length) {
+      body.tools = tools;
+      if (parallelTools) body.parallel_tool_calls = true;
+    }
     if (stream && withUsage) body.stream_options = { include_usage: true };
     return body;
   };
   let withUsage = true;
+  let parallelTools = !!(tools && tools.length);
   let res;
-  for (let attempt = 0; attempt < 2; attempt++) {
+  for (let attempt = 0; attempt < 3; attempt++) {
     res = await httpFetch(url, {
       method: 'POST',
       headers: authHeaders('openai', modelCfg.apiKey),
-      body: JSON.stringify(makeBody(withUsage)),
+      body: JSON.stringify(makeBody(withUsage, parallelTools)),
       signal: ctl.signal
     });
     if (res.ok) break;
     const t = await res.text().catch(() => '');
-    if (attempt === 0 && stream && withUsage && res.status === 400) {
-      withUsage = false;
-      continue;
+    if (res.status === 400) {
+      const lower = String(t || '').toLowerCase();
+      if (stream && withUsage && /stream_options|include_usage/.test(lower)) {
+        withUsage = false;
+        continue;
+      }
+      if (parallelTools && /parallel_tool_calls/.test(lower)) {
+        parallelTools = false;
+        continue;
+      }
+      if (stream && withUsage) {
+        withUsage = false;
+        continue;
+      }
+      if (parallelTools) {
+        parallelTools = false;
+        continue;
+      }
     }
     const err = new Error(`模型请求失败 ${res.status}：${t.slice(0, 500)}`);
     err.status = res.status;

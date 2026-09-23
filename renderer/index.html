@@ -47,7 +47,12 @@
           </div>
         </div>
       </nav>
-      <div class="title-center">SimpleCode</div>
+      <div class="title-center">
+        <span class="title-app-name" id="title-app-name">SimpleCode</span>
+        <div class="quota-bar" id="quota-bar" hidden>
+          <span class="quota-text" id="quota-text"></span>
+        </div>
+      </div>
       <div class="title-right">
         <div class="lang-switch" id="lang-switch" title="Language">
           <button type="button" data-locale="zh">中文</button>
@@ -100,17 +105,51 @@
       </div>
       <div class="chat-body">
         <aside class="file-tree" id="file-tree">
-          <div class="file-tree-head" id="tree-root-name" data-i18n="project">项目</div>
+          <div class="file-tree-head">
+            <span id="tree-root-name" data-i18n="project">项目</span>
+            <button type="button" id="btn-add-folder" data-i18n-title="addFolder" title="添加文件夹">+</button>
+          </div>
           <div class="tree-body" id="tree-body"></div>
+          <div class="clip-panel" id="clip-panel">
+            <div class="clip-head">
+              <span data-i18n="clipboardPanel">剪贴板</span>
+              <button type="button" id="btn-clip-clear" data-i18n-title="clipboardClear" title="清空历史">×</button>
+            </div>
+            <div class="clip-list" id="clip-list"></div>
+          </div>
         </aside>
         <aside class="sidebar hidden" id="sidebar">
           <div class="side-sec">
-            <h4 data-i18n="snapshots">快照</h4>
+            <h4 class="side-h4-row">
+              <span data-i18n="snapshots">快照</span>
+              <label class="snap-max-wrap" title="" data-i18n-title="snapMaxHint">
+                <span data-i18n="snapMax">上限</span>
+                <input type="number" id="snap-max" min="1" max="500" step="1" value="20" />
+              </label>
+            </h4>
             <div id="snap-list" class="side-list"></div>
           </div>
           <div class="side-sec">
             <h4><span data-i18n="skills">技能</span> <button class="link" id="btn-new-skill" data-i18n="newItem">新建</button></h4>
             <div id="skill-list" class="side-list"></div>
+          </div>
+          <div class="side-sec">
+            <h4 data-i18n="milestones">里程碑</h4>
+            <div id="milestone-list" class="side-list"></div>
+          </div>
+          <div class="side-sec">
+            <h4><span data-i18n="globalMemory">全局记忆</span>
+              <button class="link" id="btn-edit-profile" data-i18n="userProfile">用户画像</button>
+              <button class="link" id="btn-new-global-pref" data-i18n="addGlobalPref">添加全局偏好</button>
+            </h4>
+            <div id="global-pref-list" class="side-list"></div>
+          </div>
+          <div class="side-sec">
+            <h4><span data-i18n="memory">长期记忆</span>
+              <button class="link" id="btn-new-memory" data-i18n="newItem">新建</button>
+              <button class="link danger" id="btn-clear-memory" data-i18n="memoryClear">清空</button>
+            </h4>
+            <div id="memory-list" class="side-list"></div>
           </div>
           <div class="side-sec">
             <h4><span data-i18n="persona">人设</span> <button class="link" id="btn-edit-persona" data-i18n="edit">编辑</button></h4>
@@ -122,7 +161,23 @@
           </div>
         </aside>
         <div class="chat-main">
+          <div class="chat-stage">
           <div class="messages" id="messages"></div>
+          <aside id="download-panel" class="download-drawer hidden" aria-label="download list">
+            <button type="button" id="download-drawer-tab" class="download-drawer-tab" data-i18n-title="downloadList" title="下载列表">
+              <span class="download-tab-label" data-i18n="downloadTab">下载</span>
+              <span id="download-count" class="download-count hidden">0</span>
+            </button>
+            <div class="download-drawer-sheet">
+              <header class="download-panel-head">
+                <span class="download-panel-title" data-i18n="downloadList">下载列表</span>
+                <button type="button" id="download-clear-done" class="download-link hidden" data-i18n="clearDone">清除已完成</button>
+                <button type="button" id="download-panel-fold" class="download-fold" data-i18n-title="foldPanel" title="收起">›</button>
+              </header>
+              <div class="download-panel-body" id="download-list"></div>
+            </div>
+          </aside>
+          </div>
           <div class="composer-wrap" id="composer-wrap">
             <div class="composer" id="composer">
               <div class="chips" id="chips"></div>
@@ -133,6 +188,12 @@
                   <div class="select-wrap">
                     <button class="pill" id="btn-agent">∞ Agent</button>
                   </div>
+                  <label class="rounds-wrap" id="rounds-wrap" data-i18n-title="agentRoundsTitle" title="规划、大脑、代码各算各的轮数，互不扣减。开始改代码后不再吃这份轮数">
+                    <span data-i18n="agentRounds">轮数</span>
+                    <input id="input-rounds" type="number" min="1" max="64" value="16" />
+                  </label>
+                  <button type="button" class="pill ghost" id="btn-unlimited" data-i18n="unlimitedRounds" data-i18n-title="unlimitedRoundsTitle" title="打开后不再受轮数限制，直到模型自己收尾或你点停止" aria-pressed="false">全解放</button>
+                  <button type="button" class="pill ghost" id="btn-alive" data-i18n="desktopAlive" data-i18n-title="desktopAliveTitle" title="打开后出现虚拟光标，没任务时慢一点跟着你的鼠标；下命令后它自己操作屏幕" aria-pressed="false">活过来</button>
                   <div class="select-wrap">
                     <button class="pill ghost" id="btn-model"><span data-i18n="model">模型</span></button>
                     <div class="menu-drop up" id="model-menu"></div>
@@ -140,7 +201,6 @@
                 </div>
                 <div class="right">
                   <button class="icon-btn" id="btn-attach" data-i18n-title="attach" title="上传或 Ctrl+V 粘贴图片、文件、视频、文档">🖇</button>
-                  <button class="icon-btn" id="btn-mic" data-i18n-title="voice" title="语音（第一版占位）">🎤</button>
                   <button class="pill ghost" id="btn-enqueue" data-i18n="enqueue" data-i18n-title="enqueueTitle" title="把当前输入加入待发队列">排队</button>
                   <button class="send" id="btn-send" data-i18n="send">发送</button>
                 </div>
@@ -166,6 +226,10 @@
     <footer class="statusbar">
       <span id="status-ws" data-i18n="noWorkspace">未选择工作目录</span>
       <span class="grow"></span>
+      <button type="button" id="status-downloads" class="status-dl-btn hidden" title="">
+        <span class="status-dl-ico">⬇</span>
+        <span id="status-dl-n">0</span>
+      </button>
       <span id="status-model"></span>
       <span id="status-theme"></span>
     </footer>
@@ -184,6 +248,7 @@
     <button type="button" data-ctx="reveal" data-i18n="showInFolder">在文件夹中显示</button>
   </div>
 
+  <script type="module" src="./project-map.js"></script>
   <script type="module" src="./app.js"></script>
   <script type="module" src="./vision-settings.js"></script>
 </body>

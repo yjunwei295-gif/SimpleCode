@@ -239,6 +239,8 @@ module.exports = {
   ensureVectors,
   loadVectors,
   saveVectors,
+  embedText,
+  cosine,
   docText,
   TOP_OUT
 };
