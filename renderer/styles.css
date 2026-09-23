@@ -349,10 +349,12 @@ textarea { font-family: inherit; color: inherit; }
   display: flex; align-items: center; justify-content: center;
   overflow: hidden;
   opacity: 0;
+  /* 不可见时点击必须穿透，否则关闭动画期间会拦住下面的界面 */
+  pointer-events: none;
   transition: opacity 0.22s ease;
 }
 .lightbox.hidden { display: none; }
-.lightbox.is-open { opacity: 1; }
+.lightbox.is-open { opacity: 1; pointer-events: auto; }
 .lightbox img {
   max-width: 92vw; max-height: 88vh; object-fit: contain;
   transform-origin: center center; user-select: none; cursor: grab;
@@ -1102,9 +1104,11 @@ html[data-theme="dark"] .send { background: #eee; color: #111; }
   position: fixed; inset: 0; background: rgba(0,0,0,0.35);
   display: flex; align-items: center; justify-content: center; z-index: 80;
   opacity: 0;
+  /* 不可见时点击必须穿透，否则关闭动画期间会拦住下面的输入框 */
+  pointer-events: none;
   transition: opacity 0.2s ease;
 }
-.modal.is-open { opacity: 1; }
+.modal.is-open { opacity: 1; pointer-events: auto; }
 .modal-card {
   width: min(520px, 92%); background: var(--panel); border: 1px solid var(--border);
   border-radius: 14px; padding: 18px; box-shadow: var(--shadow);

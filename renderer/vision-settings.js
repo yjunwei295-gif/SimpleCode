@@ -154,11 +154,17 @@ function escapeHtmlVs(s) {
 }
 
 function openModalVs(html) {
-  $vs('modal-card').classList.add('vs-card');
-  $vs('modal-card').classList.remove('wide');
-  $vs('modal-card').onclick = null;
-  $vs('modal-card').innerHTML = html;
+  const card = $vs('modal-card');
   const modal = $vs('modal');
+  // 上一个弹窗可能排了 200ms 延迟隐藏，打开新弹窗前先取消，避免被它一起关掉
+  if (modal.__closeTimer) {
+    clearTimeout(modal.__closeTimer);
+    modal.__closeTimer = null;
+  }
+  card.classList.add('vs-card');
+  card.classList.remove('wide');
+  card.onclick = null;
+  card.innerHTML = html;
   modal.classList.remove('hidden');
   modal.classList.remove('is-open');
   void modal.offsetWidth;
@@ -167,17 +173,26 @@ function openModalVs(html) {
 
 function closeModalVs() {
   const modal = $vs('modal');
+  const card = $vs('modal-card');
+  // 弹窗内容已被别的模块换成别的弹窗时不要动它，否则会把别人的弹窗变透明甚至关掉
+  if (!modal || !card || !card.classList.contains('vs-card')) return;
   modal.classList.remove('is-open');
   const hide = () => {
+    modal.__closeTimer = null;
     modal.classList.add('hidden');
-    $vs('modal-card').classList.remove('vs-card');
+    card.classList.remove('vs-card');
   };
   try {
-    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) hide();
-    else setTimeout(hide, 200);
+    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+      hide();
+      return;
+    }
   } catch {
     hide();
+    return;
   }
+  if (modal.__closeTimer) clearTimeout(modal.__closeTimer);
+  modal.__closeTimer = setTimeout(hide, 200);
 }
 
 const ROLES = [

@@ -405,6 +405,12 @@ function escapeHtml(s) {
 function openModal(html) {
   const modal = $('modal');
   const card = $('modal-card');
+  // 模型组合弹窗关闭是延迟 200ms 隐藏的，打开新弹窗前先取消这个定时器，
+  // 否则旧定时器会把刚打开的新弹窗一起隐藏
+  if (modal.__closeTimer) {
+    clearTimeout(modal.__closeTimer);
+    modal.__closeTimer = null;
+  }
   card.classList.remove('wide', 'settings-modal', 'vs-card');
   card.onclick = null;
   card.innerHTML = html;
@@ -2569,7 +2575,7 @@ async function send() {
     const ids = skillStack();
     return {
       text,
-      skillId: ids[0] || defaultSkill()?.id || null,
+      skillId: ids[0] || null,
       skillIds: ids,
       modelId: tab.modelId || state.currentModelId,
       contextPaths: [...state.contextPaths],
@@ -4632,7 +4638,7 @@ function bind() {
     // 排队同样走快照：当前输入区的附件/引用/技能随本条入队，不继承也不留给下一条
     tabQueue(tab).push({
       text,
-      skillId: skillStack()[0] || defaultSkill()?.id || null,
+      skillId: skillStack()[0] || null,
       skillIds: skillStack(),
       modelId: tab.modelId || state.currentModelId,
       contextPaths: [...state.contextPaths],

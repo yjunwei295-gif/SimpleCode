@@ -85,9 +85,17 @@ function skillKey(s) {
   return `${s.scope || 'app'}:${s.id}`;
 }
 
+// 固定置顶的技能 id：zabingsk 永远排在技能列表第一位（即默认技能）。
+// 列表里没有 zabingsk 时，其余技能保持原有优先度顺位不变。
+const TOP_SKILL_ID = 'zabingsk';
+
 function applyOrder(skills, order) {
   const rank = new Map((order || []).map((o, i) => [`${o.scope || 'app'}:${o.id}`, i]));
   return [...skills].sort((a, b) => {
+    // 置顶判断：zabingsk 恒排最前；两个都不是或都是 zabingsk 时，继续走下面的 rank 比较（保持原顺序，sort 稳定）
+    const ta = a.id === TOP_SKILL_ID;
+    const tb = b.id === TOP_SKILL_ID;
+    if (ta !== tb) return ta ? -1 : 1;
     const ra = rank.has(skillKey(a)) ? rank.get(skillKey(a)) : 10000 + skills.indexOf(a);
     const rb = rank.has(skillKey(b)) ? rank.get(skillKey(b)) : 10000 + skills.indexOf(b);
     return ra - rb;
