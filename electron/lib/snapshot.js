@@ -87,6 +87,37 @@ function copyDirRecursive(from, to) {
   }
 }
 
+// 项目内已有同名快照时：把系统盘那份缺失的内容补进项目内那份，再删掉系统盘那份。
+// 同名直接跳过会让系统盘旧目录永远清不掉（曾造成 C 盘残留快照）
+function mergeSnapshotDir(from, to) {
+  fs.mkdirSync(to, { recursive: true });
+  for (const name of fs.readdirSync(from)) {
+    const src = path.join(from, name);
+    const dest = path.join(to, name);
+    const st = fs.statSync(src);
+    if (st.isDirectory()) {
+      mergeSnapshotDir(src, dest);
+      continue;
+    }
+    // 清单特殊处理：取 changes 更多的那份，保住更完整的回滚记录
+    if (name === 'manifest.json' && fs.existsSync(dest)) {
+      try {
+        const a = JSON.parse(fs.readFileSync(src, 'utf8'));
+        const b = JSON.parse(fs.readFileSync(dest, 'utf8'));
+        const na = Array.isArray(a.changes) ? a.changes.length : 0;
+        const nb = Array.isArray(b.changes) ? b.changes.length : 0;
+        if (na > nb) fs.copyFileSync(src, dest);
+      } catch {
+        /* 清单损坏时保留项目内那份 */
+      }
+      continue;
+    }
+    // 项目内已有的文件不覆盖，只补缺失的
+    if (fs.existsSync(dest)) continue;
+    fs.copyFileSync(src, dest);
+  }
+}
+
 // 把旧版存在系统盘的快照搬进项目内 .sinpo-snapshots，避免继续占 C 盘
 function migrateLegacySnapshots(workspace) {
   if (!workspace) return { moved: 0 };
@@ -105,7 +136,18 @@ function migrateLegacySnapshots(workspace) {
   for (const id of fs.readdirSync(legacy)) {
     const from = path.join(legacy, id);
     const to = path.join(local, id);
-    if (fs.existsSync(to)) continue;
+    if (fs.existsSync(to)) {
+      // 项目内已有同名快照：先合并系统盘那份的缺失内容再删掉它，
+      // 否则同名直接跳过会让系统盘旧目录永远清不掉
+      try {
+        mergeSnapshotDir(from, to);
+        fs.rmSync(from, { recursive: true, force: true });
+        moved += 1;
+      } catch {
+        /* 合并失败则保留系统盘那份，不丢数据 */
+      }
+      continue;
+    }
     try {
       fs.renameSync(from, to);
       moved += 1;
@@ -121,7 +163,14 @@ function migrateLegacySnapshots(workspace) {
   }
   // 旧目录已空则删掉，不留空壳占系统盘
   try {
-    if (fs.readdirSync(legacy).length === 0) fs.rmSync(legacy, { recursive: true, force: true });
+    if (fs.readdirSync(legacy).length === 0) {
+      fs.rmSync(legacy, { recursive: true, force: true });
+      // 上一级 snapshots 目录也空了就一并删掉，避免系统盘留空壳
+      const parent = path.dirname(legacy);
+      if (fs.existsSync(parent) && fs.readdirSync(parent).length === 0) {
+        fs.rmSync(parent, { recursive: true, force: true });
+      }
+    }
   } catch {
     /* 忽略清理失败 */
   }
