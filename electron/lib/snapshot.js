@@ -13,6 +13,29 @@ const SCAN_SKIP = new Set([
 const SCAN_MAX_DEPTH = 12;
 const SCAN_MAX_FILES = 8000;
 
+// 快照只用于源码回滚。模型权重、压缩包、可执行文件这类大二进制不进快照，
+// 否则 run_command 前的整工作区备份会把 GB 级权重反复拷进 C 盘 userData，撑爆系统盘
+const SNAP_SKIP_EXT = new Set([
+  '.gguf', '.safetensors', '.bin', '.pt', '.pth', '.ckpt', '.onnx', '.msgpack',
+  '.exe', '.dll', '.so', '.dylib', '.node', '.zip', '.7z', '.rar', '.gz', '.tar', '.iso',
+  '.mp4', '.mov', '.avi', '.mkv', '.wav', '.mp3', '.flac',
+  '.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.ico', '.pdf'
+]);
+// 单文件超过这个体积也不进快照：源码文件几乎不会这么大
+const SNAP_MAX_BYTES = 8 * 1024 * 1024;
+
+// 判断某个文件是否跳过快照备份（按扩展名或体积）
+function shouldSkipSnapshotFile(abs) {
+  const ext = path.extname(String(abs || '')).toLowerCase();
+  if (SNAP_SKIP_EXT.has(ext)) return true;
+  try {
+    const st = fs.statSync(abs);
+    return !st.isFile() || st.size > SNAP_MAX_BYTES;
+  } catch {
+    return true;
+  }
+}
+
 const DEFAULT_MAX_SNAPSHOTS = 20;
 const MIN_MAX = 1;
 const MAX_MAX = 500;
@@ -107,6 +130,8 @@ function recordChange(workspace, snapshot, relPath, action, opts = {}) {
   if (!norm) return;
   const abs = path.resolve(workspace, ...parts);
   if (!isInside(workspace, abs)) throw new Error('路径超出工作目录');
+  // 权重等大二进制不进快照：不记条目也不备份，避免还原语义被破坏
+  if (shouldSkipSnapshotFile(abs)) return;
   const existed = opts.existedBefore != null
     ? !!opts.existedBefore
     : (fs.existsSync(abs) && fs.statSync(abs).isFile());
@@ -158,6 +183,7 @@ function scanFingerprints(workspace) {
         continue;
       }
       if (!ent.isFile()) continue;
+      if (shouldSkipSnapshotFile(abs)) continue;
       try {
         const st = fs.statSync(abs);
         const rel = path.relative(root, abs).replace(/\\/g, '/');
@@ -223,6 +249,7 @@ function preBackupWorkspace(workspace, snapshot) {
         continue;
       }
       if (!ent.isFile()) continue;
+      if (shouldSkipSnapshotFile(abs)) continue;
       const rel = path.relative(root, abs).replace(/\\/g, '/');
       const dest = nestedUnder(filesRoot, rel);
       if (fs.existsSync(dest)) continue;
@@ -327,6 +354,7 @@ function captureAfter(workspace, snapshot) {
     const parts = relParts(change.path);
     if (!parts.length) continue;
     const abs = path.resolve(workspace, ...parts);
+    if (shouldSkipSnapshotFile(abs)) continue;
     const exists = fs.existsSync(abs) && fs.statSync(abs).isFile();
     change.afterExisted = !!exists;
     if (exists) copyFileSafe(abs, nestedUnder(path.join(snapshot.dir, 'after'), change.path));
@@ -533,6 +561,6 @@ function rejectFileHunk(workspace, snapshotId, relPath, hunkIndex) {
 module.exports = {
   create, recordChange, captureAfter, list, restore, undo, redo,
   scanFingerprints, diffFingerprints, preBackupWorkspace, recordCommandDiff,
-  listFileHunks, rejectFileHunk,
+  listFileHunks, rejectFileHunk, shouldSkipSnapshotFile,
   getMax, setMax, DEFAULT_MAX_SNAPSHOTS, MIN_MAX, MAX_MAX
 };
