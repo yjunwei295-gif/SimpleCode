@@ -24,3 +24,7 @@ models/*.gguf
 models/*.GGUF
 Test.zip
 *.zip
+
+# 模型权重与元数据（GB 级，禁止入库）
+*.safetensors
+*.sc-meta.json
