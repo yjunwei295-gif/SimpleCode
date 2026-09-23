@@ -22,7 +22,7 @@ const SNAP_SKIP_EXT = new Set([
   '.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.ico', '.pdf'
 ]);
 // 单文件超过这个体积也不进快照：源码文件几乎不会这么大
-const SNAP_MAX_BYTES = 8 * 1024 * 1024;
+const SNAP_MAX_BYTES = 100 * 1024 * 1024;
 
 // 判断某个文件是否跳过快照备份（按扩展名或体积）
 function shouldSkipSnapshotFile(abs) {
@@ -40,8 +40,24 @@ const DEFAULT_MAX_SNAPSHOTS = 20;
 const MIN_MAX = 1;
 const MAX_MAX = 500;
 
-function rootDir() {
-  return path.join(app.getPath('userData'), 'snapshots');
+// 旧版快照目录：系统盘 userData 下按项目哈希分目录
+function legacyRootDir(workspace) {
+  return path.join(app.getPath('userData'), 'snapshots', workspaceKey(workspace));
+}
+
+// 快照根目录：优先放项目内 .sinpo-snapshots（跟项目走，不会写满系统盘）；
+// 项目目录不可写时退回系统盘旧目录，避免无法写文件
+function rootDir(workspace) {
+  if (workspace) {
+    const local = path.join(path.resolve(String(workspace)), '.sinpo-snapshots');
+    try {
+      fs.mkdirSync(local, { recursive: true });
+      return local;
+    } catch {
+      /* 项目目录不可写，退回系统盘 */
+    }
+  }
+  return legacyRootDir(workspace);
 }
 
 function workspaceKey(workspace) {
@@ -50,7 +66,66 @@ function workspaceKey(workspace) {
 }
 
 function snapDir(workspace, id) {
-  return path.join(rootDir(), workspaceKey(workspace), id);
+  return path.join(rootDir(workspace), id);
+}
+
+// 每个项目每次运行只迁移一次，避免反复扫系统盘
+const migratedWorkspaces = new Set();
+
+// 递归复制目录（跨盘 rename 失败时用），单文件失败跳过不影响其他文件
+function copyDirRecursive(from, to) {
+  fs.mkdirSync(to, { recursive: true });
+  for (const name of fs.readdirSync(from)) {
+    const src = path.join(from, name);
+    const dest = path.join(to, name);
+    const st = fs.statSync(src);
+    if (st.isDirectory()) {
+      copyDirRecursive(src, dest);
+      continue;
+    }
+    fs.copyFileSync(src, dest);
+  }
+}
+
+// 把旧版存在系统盘的快照搬进项目内 .sinpo-snapshots，避免继续占 C 盘
+function migrateLegacySnapshots(workspace) {
+  if (!workspace) return { moved: 0 };
+  const key = path.resolve(String(workspace)).toLowerCase();
+  if (migratedWorkspaces.has(key)) return { moved: 0 };
+  migratedWorkspaces.add(key);
+  const legacy = legacyRootDir(workspace);
+  const local = path.join(path.resolve(String(workspace)), '.sinpo-snapshots');
+  if (legacy === local || !fs.existsSync(legacy)) return { moved: 0 };
+  try {
+    fs.mkdirSync(local, { recursive: true });
+  } catch {
+    return { moved: 0 };
+  }
+  let moved = 0;
+  for (const id of fs.readdirSync(legacy)) {
+    const from = path.join(legacy, id);
+    const to = path.join(local, id);
+    if (fs.existsSync(to)) continue;
+    try {
+      fs.renameSync(from, to);
+      moved += 1;
+    } catch {
+      try {
+        copyDirRecursive(from, to);
+        fs.rmSync(from, { recursive: true, force: true });
+        moved += 1;
+      } catch {
+        /* 单份迁移失败不影响其他快照 */
+      }
+    }
+  }
+  // 旧目录已空则删掉，不留空壳占系统盘
+  try {
+    if (fs.readdirSync(legacy).length === 0) fs.rmSync(legacy, { recursive: true, force: true });
+  } catch {
+    /* 忽略清理失败 */
+  }
+  return { moved };
 }
 
 function configPath(workspace) {
@@ -107,6 +182,7 @@ function copyFileSafe(from, to) {
 }
 
 function create(workspace, label) {
+  migrateLegacySnapshots(workspace);
   // id 加随机短串，避免同一毫秒创建两条快照时撞车、复用旧目录导致覆盖
   const id = `snap_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
   const dir = snapDir(workspace, id);
@@ -287,12 +363,13 @@ function recordCommandDiff(workspace, snapshot, before, after) {
 }
 
 function list(workspace) {
+  migrateLegacySnapshots(workspace);
   prune(workspace);
   return readAll(workspace);
 }
 
 function readAll(workspace) {
-  const dir = path.join(rootDir(), workspaceKey(workspace));
+  const dir = rootDir(workspace);
   if (!dir || !fs.existsSync(dir)) return [];
   const ids = fs.readdirSync(dir);
   const items = [];
@@ -562,5 +639,6 @@ module.exports = {
   create, recordChange, captureAfter, list, restore, undo, redo,
   scanFingerprints, diffFingerprints, preBackupWorkspace, recordCommandDiff,
   listFileHunks, rejectFileHunk, shouldSkipSnapshotFile,
+  migrateLegacySnapshots,
   getMax, setMax, DEFAULT_MAX_SNAPSHOTS, MIN_MAX, MAX_MAX
 };

@@ -25,6 +25,9 @@ models/*.GGUF
 Test.zip
 *.zip
 
+# 项目内快照目录（跟项目走，不入库）
+.sinpo-snapshots/
+
 # 模型权重与元数据（GB 级，禁止入库）
 *.safetensors
 *.sc-meta.json
